@@ -34,6 +34,7 @@ from config import GRIDS, Scales                                    # grids and 
 from physics_neural_solver import physical_equations as eq          # all equations and the loss
 from physics_neural_solver.model import PhysicsNeuralSolver, count_weights   # the network
 from physics_neural_solver.plot_losses import plot as plot_losses  # the loss graph (losses.png)
+from physics_neural_solver.terminal_log import TerminalLog          # progress in the terminal
 from physics_neural_solver.training_pool import TrainingPool        # where the training states come from
 
 
@@ -156,11 +157,23 @@ def train(settings: TrainingSettings, resume: bool = False):
         model.load_state_dict(checkpoint["model"])                  # network weights
         optimizer.load_state_dict(checkpoint["optimizer"])          # optimiser memory
         start_step = checkpoint["step"]                             # progress
-        print(f"Resumed from step {start_step}. The pool starts again from calm water.")
 
-    print(f"Training on {device}: grid {settings.grid} {tuple(pool.simulation.positions.shape[2:])} cells, "
-          f"network {settings.network_size} ({count_weights(model):,} weights), batch {settings.batch_size}, "
-          f"dt = {settings.time_step_seconds * 1000:.1f} ms, {settings.total_steps} steps")
+    terminal = TerminalLog(settings.total_steps, start_step, gpu=device.type == "cuda")   # progress in the terminal
+    gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "none (CPU)"
+    terminal.settings_block({
+        "run": f"{settings.run_name}   ->   {run_dir}/",
+        "device": f"{device}   GPU: {gpu_name}",
+        "grid": f"{settings.grid}, {tuple(pool.simulation.positions.shape[2:])} cells (with walls)",
+        "network": f"{settings.network_size}, {count_weights(model):,} weights, precision {settings.precision}",
+        "batch / pool": f"{settings.batch_size} scenes per step / {settings.pool_size} scenes in the pool",
+        "time step": f"{settings.time_step_seconds * 1000:.1f} ms of water time per network step",
+        "stages (steps)": ", ".join(f"{name} {steps:,}" for name, steps in settings.stage_steps.items())
+                          + f"   (total {settings.total_steps:,})",
+        "learning rate": f"{settings.learning_rate:.1e} -> {settings.final_learning_rate:.1e} (cosine)",
+        "log / checkpoint": f"every {settings.log_every} / {settings.checkpoint_every} steps",
+        "start": f"resumed from step {start_step:,} (the pool starts again from calm water)" if start_step else "step 0",
+    })
+    terminal.say("Training has no epochs (no dataset): progress is in steps. Columns: loss of every equation (eq. number).")
 
     log_path = run_dir / "log.csv"                                  # the log file
     new_log = not (resume and log_path.exists())                    # start a new log, or append
@@ -176,7 +189,8 @@ def train(settings: TrainingSettings, resume: bool = False):
         stage = stage_at(step, settings.stage_steps)                # calm, tilt or stone
         if stage != pool.stage:                                     # a new curriculum stage begins
             pool.set_stage(stage)
-            print(f"step {step}: stage '{stage}'")
+            terminal.say(f"---- step {step:,}: stage '{stage}' begins "
+                         f"({ {'calm': 'water at rest', 'tilt': 'the box tilts', 'stone': 'stones are thrown in'}[stage] }) ----")
         for group in optimizer.param_groups:                        # learning-rate schedule
             group["lr"] = learning_rate_at(step, settings)
 
@@ -190,9 +204,9 @@ def train(settings: TrainingSettings, resume: bool = False):
                          + [f"{optimizer.param_groups[0]['lr']:.2e}", f"{seconds:.3f}", resets_since_log,
                             f"{stats['volume_error_mean']:.4f}", f"{stats['potential_max']:.3f}", stats["stones_active"]])
             log_file.flush()                                        # keep the file up to date
-            print(f"step {step + 1:6d} [{stage:5s}]  total {float(total):.3e}  momentum {float(terms['momentum (eq. 2)']):.3e}  "
-                  f"surface {float(terms['level set (eq. 5)']):.3e}  volume err {stats['volume_error_mean']:.4f}  "
-                  f"{seconds:.3f} s/step")
+            gpu_memory = torch.cuda.max_memory_allocated(device) / 1e9 if device.type == "cuda" else None
+            terminal.row(step + 1, stage, float(total), terms, optimizer.param_groups[0]["lr"], seconds,
+                         resets_since_log, gpu_memory)
             clock, resets_since_log = time.time(), 0
 
         if (step + 1) % settings.checkpoint_every == 0 or step + 1 == settings.total_steps:   # save progress
@@ -200,11 +214,13 @@ def train(settings: TrainingSettings, resume: bool = False):
                         "settings": asdict(settings)}, checkpoint_path)
             try:
                 plot_losses(run_dir)                                # refresh losses.png
+                terminal.say(f"checkpoint saved at step {step + 1:,}  ->  checkpoint.pt, losses.png")
             except Exception as error:                              # a plotting problem must never stop training
-                print(f"(could not draw losses.png: {error})")
+                terminal.say(f"checkpoint saved at step {step + 1:,} (could not draw losses.png: {error})")
 
     log_file.close()                                                # done
-    print(f"Finished. Checkpoint: {checkpoint_path}   Log: {log_path}")
+    terminal.say(f"Finished {settings.total_steps:,} steps.  Checkpoint: {checkpoint_path}   Log: {log_path}   "
+                 f"Graphs: {run_dir}/losses.png")
     return model
 
 
