@@ -12,3 +12,6 @@ outputs/checkpoints/
 .DS_Store
 .vscode/
 .idea/
+
+# test networks for the viewer equivalence test (regenerate with: python -m physics_neural_solver.export_for_browser --test-network)
+outputs/export/test_network_*/

@@ -11,6 +11,7 @@ import GUI from "three/addons/libs/lil-gui.module.min.js";
 
 import { BOX, GRIDS, STONE, WATER } from "./config.js";
 import { WaterSolver } from "./solver/water_solver.js";
+import { NeuralWaterSolver } from "./neural/neural_solver.js";
 import { SurfaceMesher } from "./surface_nets.js";
 import { Stone } from "./stone.js";
 
@@ -23,8 +24,31 @@ function showError(text) {
 window.addEventListener("error", (e) => showError(`Error: ${e.message}`));
 window.addEventListener("unhandledrejection", (e) => showError(`Error: ${e.reason?.message ?? e.reason}`));
 
-const gridName = new URLSearchParams(location.search).get("grid") === "fine" ? "fine" : "coarse";
-const solver = await WaterSolver.create(GRIDS[gridName]);
+// which solver:  ?solver=classical (default)   or   ?solver=neural&model=<run name>  (files from export_for_browser.py)
+const query = new URLSearchParams(location.search);
+const solverKind = query.get("solver") === "neural" ? "neural" : "classical";
+const modelName = query.get("model") ?? "coarse_small";
+let solver, gridName;
+if (solverKind === "neural") {
+  try {
+    solver = await NeuralWaterSolver.create(`../outputs/export/${modelName}/`);   // the trained network
+  } catch (error) {
+    showError(`Could not load the neural solver "${modelName}" (${error.message}).\n` +
+      "Export it first:  python -m physics_neural_solver.export_for_browser --run " + modelName + "\n" +
+      "and serve the repository folder:  python3 -m http.server 8001  ->  http://localhost:8001/classical_solver/?solver=neural");
+    throw error;
+  }
+  gridName = solver.manifest.grid.name;                                         // the grid the network was trained on
+  if (query.get("test") === "equivalence") {                                    // browser vs PyTorch, one step
+    solver.runEquivalenceTest().then((result) => {                              // (runs while the page keeps rendering)
+      document.title = "equivalence " + Object.entries(result)
+        .map(([name, r]) => typeof r === "string" ? `${name}: ${r}` : `${name}: max error ${r.maxError.toExponential(2)} (values up to ${r.maxValue.toFixed(3)})`).join(" | ");
+    });
+  }
+} else {
+  gridName = query.get("grid") === "fine" ? "fine" : "coarse";
+  solver = await WaterSolver.create(GRIDS[gridName]);                           // the classical solver
+}
 message.hidden = true;
 
 // ---------------------------------------------------------------- settings
@@ -34,6 +58,7 @@ const settings = {
   stoneDiameterCm: 7,
   stoneDensity: 2500,
   grid: gridName,
+  solver: solverKind,
   resetWater: () => resetWater(),
 };
 
@@ -244,7 +269,11 @@ gui.add(settings, "tiltDegrees", -BOX.maxTiltDegrees, BOX.maxTiltDegrees, 0.5).n
 gui.add(settings, "stoneDiameterCm", STONE.minDiameter * 100, STONE.maxDiameter * 100, 0.5).name("stone diameter (cm)");
 gui.add(settings, "stoneDensity", STONE.minDensity, STONE.maxDensity, 50).name("stone density (kg/m³)");
 gui.add(settings, "resetWater").name("reset water");
-gui.add(settings, "grid", Object.keys(GRIDS)).name("grid").onChange((value) => { location.search = `?grid=${value}`; });
+gui.add(settings, "solver", ["classical", "neural"]).name("solver").onChange((value) => {
+  location.search = value === "neural" ? `?solver=neural&model=${modelName}` : `?grid=${gridName}`; });
+if (solverKind === "classical") {
+  gui.add(settings, "grid", Object.keys(GRIDS)).name("grid").onChange((value) => { location.search = `?grid=${value}`; });
+}
 
 // ---------------------------------------------------------------- animation loop
 const timer = new THREE.Timer();
@@ -287,9 +316,9 @@ function animate() {
       stoneMesh.visible = true;
     }
   }
-  const dt = realDt * testTimeSpeed;
+  const dt = solver.fixedStep ?? realDt * testTimeSpeed;   // the neural solver always steps by its training time step
 
-  if (dt > 0 && solver.readback.some((s) => !s.busy)) {
+  if (dt > 0 && query.get("test") !== "equivalence" && solver.readback.some((s) => !s.busy)) {   // (no simulation during the equivalence test)
     // tilt: move towards the slider angle, at most 30 degrees per second
     const target = THREE.MathUtils.degToRad(settings.tiltDegrees);
     const maxRate = THREE.MathUtils.degToRad(BOX.maxTiltRateDegrees);
@@ -335,7 +364,7 @@ function animate() {
     }
     mirror.src = renderer.domElement.toDataURL();
   }
-  if (testMode && totalRendered % 20 === 0) {
+  if (testMode && testMode !== "equivalence" && totalRendered % 20 === 0) {
     const summary = [];
     for (let t = 0.5; t <= simulationTime; t += 1.0) {
       const near = window.__series.filter(([time]) => Math.abs(time - t) < 0.5).map(([, v]) => v);
