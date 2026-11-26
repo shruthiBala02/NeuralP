@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# large files that should never be committed (model checkpoints come later)
+outputs/checkpoints/
+*.pt
+*.pth
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/
