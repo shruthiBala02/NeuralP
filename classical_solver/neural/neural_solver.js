@@ -1,4 +1,8 @@
-// The physics neural solver in the browser: runs the exported 3D U-Net (physics_neural_solver/model.py) on the GPU.
+// The physics neural solver in the browser: runs the exported 3D U-Net (physics_neural_solver/model.py) on the GPU,
+// followed by the same STRICT RULES as PyTorch (exact, whatever the network outputs):
+//   eq. 10  no flow through walls (A fixed on the wall planes)      eq. 5  the surface is carried by the flow
+//   eq. 7   the water volume is restored exactly                   eq. 8  no pressure in the air
+//   eq. 6   phi is re-distanced every 4 steps (as simulation.py)
 //
 // It has the same interface as the classical WaterSolver (reset, runFrame, latestPhi, latestVelocity, ...), so the
 // viewer can switch between the two. One network step = one time step of `fixedStep` seconds (the training step).
@@ -80,14 +84,14 @@ export class NeuralWaterSolver {
     return this.pipelines[name];
   }
 
-  operation(name, code, buffers, threads, workgroupsOverride) { // one dispatch: shader + buffers + how many threads
+  operation(name, code, buffers, threads, workgroupsOverride, list = this.operations) {   // one dispatch: shader + buffers + threads
     const pipeline = this.pipeline(name, code);
     const bindGroup = this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })) });
     const groups = workgroupsOverride ?? Math.ceil(threads / 64);   // 64 threads per workgroup
     const workgroups = workgroupsOverride ? [groups, 1, 1] : [Math.min(groups, 65535), Math.ceil(groups / 65535), 1];
-    this.operations.push({ pipeline, bindGroup, workgroups });
+    list.push({ pipeline, bindGroup, workgroups });
   }
 
   offset(name) { return this.layers[name].offset; }             // where a weight tensor starts in weights.bin
@@ -151,17 +155,63 @@ export class NeuralWaterSolver {
       this.operation("copy", S.COPY, [this.uniform([count, count, 0, 0]), skips[level], merged], count);   // skip after the upsampled half
       x = block(merged, 2 * channels[level], channels[level], level, `network.up_blocks.${i}`);
     }
-    const change = convolution(x, channels[0], 5, 0, "network.output", 1);   // 1x1 conv to the 5 outputs
-    this.debugBuffers.change = [change, 5 * cells[0]];
+    const change = convolution(x, channels[0], 4, 0, "network.output", 1);   // 1x1 conv to the 4 outputs (dA, dp)
+    this.debugBuffers.change = [change, 4 * cells[0]];
 
+    // ---- the strict rules (model.PhysicsNeuralSolver.forward), in the same order as PyTorch
+    const N = this.cellCount;
     const [px, py, pz] = this.padded;
     const cropParams = this.uniform([this.nx, this.ny, this.nz, 0, px, py, pz, 0]);
+    const grid = (axis = 0) => this.uniform([this.nx, this.ny, this.nz, axis, { f: this.hd },
+                                             { f: this.fixedStep / this.scales.time }, { f: 0 }, { f: 0 }]);
+    this.gridParams = grid();
+    this.velocityNow = this.storage(3 * N);                     // u = curl(A) before the step
+    this.phiTemporary = this.storage(N);                        // scratch for phi
+    this.phiSign = this.storage(N);                             // phi before re-distancing (its sign)
+    this.volumeStats = this.storage(4);                         // volume, d(volume)/d(shift), shift
+    this.targetVolume = this.storage(4);                        // the water volume to keep (eq. 7)
+    const curlParams = this.uniform([this.nx, this.ny, this.nz, 0, { f: this.hd }, { f: 0 }, { f: 0 }, { f: 0 }]);
+    this.operation("curl", S.CURL, [curlParams, this.state.potential, this.velocityNow], N);   // u now
     const mean = this.storage(3);
     this.operation("mean", S.POTENTIAL_CHANGE_MEAN, [cropParams, change, mean], 0, 3);   // mean of dA (3 workgroups)
-    this.operation("apply", S.APPLY_CHANGE, [cropParams, change, mean, this.state.phi, this.state.potential,
-                                             this.state.pressure], this.cellCount);
-    this.operation("curl", S.CURL, [this.uniform([this.nx, this.ny, this.nz, 0, { f: this.hd }, { f: 0 }, { f: 0 }, { f: 0 }]),
-                                    this.state.potential, this.state.velocity], this.cellCount);
+    this.operation("apply", S.APPLY_CHANGE, [cropParams, change, mean, this.state.potential, this.state.pressure], N);   // A (walls), p
+    this.operation("curl", S.CURL, [curlParams, this.state.potential, this.state.velocity], N);   // u next
+    this.operation("carry", S.CARRY_SURFACE, [this.gridParams, this.state.phi, this.velocityNow, this.state.velocity,
+                                              this.phiTemporary], N);   // eq. 5: phi carried by the flow
+    this.copyWalls(this.phiTemporary, this.operations);         // walls copy the inside
+    this.operation("copy", S.COPY, [this.uniform([N, 0, 0, 0]), this.phiTemporary, this.state.phi], N);
+    this.restoreVolume(this.operations);                        // eq. 7: exactly the same water
+    this.operation("mask_p", S.MASK_PRESSURE, [this.gridParams, this.state.phi, this.state.pressure], N);   // eq. 8
+
+    // ---- every few steps: re-distancing (eq. 6, simulation.py), then the volume again
+    this.redistanceOperations = [];
+    const R = this.redistanceOperations;
+    this.operation("copy", S.COPY, [this.uniform([N, 0, 0, 0]), this.state.phi, this.phiSign], N, undefined, R);
+    for (let it = 0; it < this.manifest.strict_rules.redistance_iterations; it++) {
+      this.operation("redistance", S.REDISTANCE, [this.gridParams, this.state.phi, this.phiSign, this.phiTemporary], N, undefined, R);
+      this.copyWalls(this.phiTemporary, R);
+      this.operation("copy", S.COPY, [this.uniform([N, 0, 0, 0]), this.phiTemporary, this.state.phi], N, undefined, R);
+    }
+    this.restoreVolume(R);
+
+    // ---- measuring the volume after a reset
+    this.measureOperations = [];
+    this.operation("volume", S.VOLUME_SUM, [this.inputParams, this.state.phi, this.targetVolume, this.volumeStats], 0, 1,
+                   this.measureOperations);
+  }
+
+  copyWalls(field, list) {                                      // x, then y, then z (as copy_walls_from_inside)
+    for (let axis = 0; axis < 3; axis++) {
+      this.operation("walls", S.COPY_WALLS_FROM_INSIDE, [this.uniform([this.nx, this.ny, this.nz, axis, { f: this.hd },
+        { f: 0 }, { f: 0 }, { f: 0 }]), field], this.cellCount, undefined, list);
+    }
+  }
+
+  restoreVolume(list) {                                         // Newton steps (as restore_volume)
+    for (let it = 0; it < this.manifest.strict_rules.volume_newton_steps; it++) {
+      this.operation("volume", S.VOLUME_SUM, [this.inputParams, this.state.phi, this.targetVolume, this.volumeStats], 0, 1, list);
+      this.operation("shift", S.SHIFT, [this.gridParams, this.volumeStats, this.state.phi], this.cellCount, undefined, list);
+    }
   }
 
   // ------------------------------------------------------------------------------------------- one step
@@ -179,9 +229,9 @@ export class NeuralWaterSolver {
     this.device.queue.writeBuffer(this.inputParams, 0, data);
   }
 
-  encodeStep(encoder) {
+  encodeStep(encoder, operations = this.operations) {
     const pass = encoder.beginComputePass();
-    for (const op of this.operations) {                         // the whole network, in order
+    for (const op of operations) {                              // the whole network + strict rules, in order
       pass.setPipeline(op.pipeline);
       pass.setBindGroup(0, op.bindGroup);
       pass.dispatchWorkgroups(...op.workgroups);
@@ -196,8 +246,9 @@ export class NeuralWaterSolver {
     const phi = new Float32Array(N), pressure = new Float32Array(N);
     const up = [Math.sin(tilt), Math.cos(tilt)];                // "up" in the box frame
     const surfaceY = -BOX.height / 2 / L + depth / L;            // surface point (dimensionless), box middle
+    const inside = (a, n) => Math.min(Math.max(a, 1), n - 2);  // wall cells copy the nearest inside cell
     for (let i = 0; i < this.nx; i++) for (let j = 0; j < this.ny; j++) for (let k = 0; k < this.nz; k++) {
-      const x = ((i - 0.5) * this.h - BOX.length / 2) / L, y = ((j - 0.5) * this.h - BOX.height / 2) / L;
+      const x = ((inside(i, this.nx) - 0.5) * this.h - BOX.length / 2) / L, y = ((inside(j, this.ny) - 0.5) * this.h - BOX.height / 2) / L;
       const t = (i * this.ny + j) * this.nz + k;                // PyTorch order
       phi[t] = up[0] * (0 - x) + up[1] * (surfaceY - y);        // signed distance below the surface
       pressure[t] = Math.max(phi[t], 0);                        // hydrostatic (dimensionless)
@@ -206,6 +257,12 @@ export class NeuralWaterSolver {
     q.writeBuffer(this.state.phi, 0, phi);
     q.writeBuffer(this.state.pressure, 0, pressure);
     q.writeBuffer(this.state.potential, 0, new Float32Array(3 * N));   // at rest
+    this.writeInputParams({ gravity: [0, -1, 0], tiltRate: 0, tiltAcceleration: 0, stone: null });   // no stone
+    const encoder = this.device.createCommandEncoder();          // measure the starting volume on the GPU (eq. 7) ...
+    this.encodeStep(encoder, this.measureOperations);
+    encoder.copyBufferToBuffer(this.volumeStats, 0, this.targetVolume, 0, 4);   // ... and keep it as the target
+    q.submit([encoder.finish()]);
+    this.stepsSinceReset = 0;                                   // for re-distancing every few steps
     this.latestPhi = this.toViewerOrder(phi, L);
     const zeros = new Float32Array(N);
     this.latestVelocity = { ux: zeros, uy: zeros, uz: zeros };
@@ -225,7 +282,11 @@ export class NeuralWaterSolver {
                        spin: stone.spin.map((w) => w * T), radius: stone.radius / L } : null,
     });
     const encoder = this.device.createCommandEncoder();
-    this.encodeStep(encoder);
+    this.encodeStep(encoder);                                   // network + strict rules
+    this.stepsSinceReset += 1;
+    if (this.stepsSinceReset % this.manifest.strict_rules.redistance_every === 0) {
+      this.encodeStep(encoder, this.redistanceOperations);      // eq. 6, every few steps (as simulation.py)
+    }
     const bytes = this.cellCount * 4;
     encoder.copyBufferToBuffer(this.state.phi, 0, staging.buffer, 0, bytes);
     encoder.copyBufferToBuffer(this.state.velocity, 0, staging.buffer, bytes, 3 * bytes);
@@ -278,10 +339,12 @@ export class NeuralWaterSolver {
     const expected = { phi: take(N), potential: take(3 * N), pressure: take(N), velocity: take(3 * N) };
     expected.input = take(this.debugBuffers.input[1]);          // intermediate results
     expected.change = take(this.debugBuffers.change[1]);
+    const expectedRedistanced = take(N);                        // phi after re-distancing + volume
     const q = this.device.queue;
     q.writeBuffer(this.state.phi, 0, phi);
     q.writeBuffer(this.state.potential, 0, potential);
     q.writeBuffer(this.state.pressure, 0, pressure);
+    q.writeBuffer(this.targetVolume, 0, new Float32Array([tc.initial_volume, 0, 0, 0]));   // the volume to keep
     const gravity = [-Math.sin(tc.tilt), -Math.cos(tc.tilt), 0];
     this.writeInputParams({ gravity, tiltRate: tc.tilt_rate, tiltAcceleration: tc.tilt_acceleration, stone: tc.stone });
     const encoder = this.device.createCommandEncoder();
@@ -316,6 +379,17 @@ export class NeuralWaterSolver {
       }
       buffer.unmap();
     }
+    const encoder2 = this.device.createCommandEncoder();         // then re-distancing (eq. 6) + volume, as every 4th step
+    this.encodeStep(encoder2, this.redistanceOperations);
+    const phiBuffer = this.device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    encoder2.copyBufferToBuffer(this.state.phi, 0, phiBuffer, 0, N * 4);
+    q.submit([encoder2.finish()]);
+    await phiBuffer.mapAsync(GPUMapMode.READ);
+    const got = new Float32Array(phiBuffer.getMappedRange());
+    let worst = 0, size = 0;
+    for (let i = 0; i < N; i++) { worst = Math.max(worst, Math.abs(got[i] - expectedRedistanced[i])); size = Math.max(size, Math.abs(expectedRedistanced[i])); }
+    result.redistanced = { maxError: worst, maxValue: size };
+    phiBuffer.unmap();
     return result;
   }
 }

@@ -29,7 +29,10 @@ def test_test_network_export_is_complete_and_consistent(tmp_path, monkeypatch):
         test = np.fromfile(folder / "test_case.bin", dtype=np.float32)
         cells = 42 * 22 * 22
         padded = 48 * 24 * 24                                       # padded to a multiple of 2^3
-        assert test.size == 13 * cells + 20 * padded                # state, expected state and velocity, input, output
+        assert test.size == 14 * cells + 19 * padded                # state, expected state and velocity, input (15),
+                                                                    # output (4), phi after re-distancing
+        assert manifest["output_order"] == ["dA_x", "dA_y", "dA_z", "dp"]   # phi is carried, not predicted
+        assert manifest["test_case"]["initial_volume"] > 0
         assert np.isfinite(test).all()
     finally:
         os.chdir(here)

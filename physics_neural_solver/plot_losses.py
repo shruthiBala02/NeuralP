@@ -4,9 +4,9 @@ plot_losses.py  -  draw how every loss term changes during training
     python -m physics_neural_solver.plot_losses --run coarse_small      # reads outputs/runs/coarse_small/log.csv
 
 Writes two pictures into outputs/runs/<run>/:
-    losses.png               ONE graph: the total loss (thick black) and the 8 equations (one colour each), smoothed,
+    losses.png               ONE graph: the total loss (thick black) and the 9 terms (one colour each), smoothed,
                              on one logarithmic axis; thin vertical lines mark the curriculum stages (calm -> tilt -> stone)
-    losses_by_equation.png   the same nine curves in separate panels (each with its own axis), with every logged value
+    losses_by_equation.png   the same ten curves in separate panels (each with its own axis), with every logged value
 A term that is exactly 0 (e.g. the water-stone loss before any stone is thrown) cannot be drawn on a log axis,
 so its line starts when it first becomes non-zero.
 train.py also calls this at every checkpoint, so the pictures stay up to date while training runs.
@@ -27,18 +27,20 @@ SECONDARY_INK = "#52514e"                                           # axis label
 GRID = "#e4e3df"                                                    # hairline grid, one step off the background
 LINE = "#2a78d6"                                                    # the data (one series per panel)
 EQUATION_COLOURS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",      # one fixed colour per equation (eqs. 2, 5, 6, 7,
-                    "#e87ba4", "#008300", "#6250d6", "#e34948"]      #  9, 10, 11, 13), never re-ordered
+                    "#e87ba4", "#008300", "#6250d6", "#e34948",      #  9, 10, 11, 13 and the energy rule),
+                    "#5c5a55"]                                      #  never re-ordered
 
 PANELS = [                                                          # (column in log.csv, panel title)
     ("total", "Total loss (weighted sum)"),
     ("momentum (eq. 2)", "Momentum, Navier-Stokes (eq. 2)"),
-    ("level set (eq. 5)", "Surface transport (eq. 5)"),
-    ("eikonal (eq. 6)", "Eikonal, sharp surface (eq. 6)"),
-    ("volume (eq. 7)", "Volume conservation (eq. 7)"),
+    ("level set (eq. 5)", "Surface transport (eq. 5, exact)"),
+    ("eikonal (eq. 6)", "Eikonal, sharp surface (eq. 6, exact)"),
+    ("volume (eq. 7)", "Volume conservation (eq. 7, exact)"),
     ("no shear (eq. 9)", "Free-surface no-shear (eq. 9)"),
-    ("no penetration (eq. 10)", "Wall no-penetration (eq. 10)"),
+    ("no penetration (eq. 10)", "Wall no-penetration (eq. 10, exact)"),
     ("wall law (eq. 11)", "Wall friction, wall law (eq. 11)"),
     ("stone boundary (eq. 13)", "Water-stone boundary (eq. 13)"),
+    ("energy (rule)", "Energy can't grow by itself (rule)"),
 ]
 
 
@@ -48,7 +50,8 @@ def read_log(path: Path):
         rows = list(csv.DictReader(f))                              # one dict per log line
     if not rows:
         raise ValueError(f"{path} has no data yet")
-    columns = {name: np.array([float(r[name]) for r in rows]) for name, _ in PANELS}   # the loss columns
+    columns = {name: np.array([float(r[name]) if name in r else 0.0 for r in rows]) for name, _ in PANELS}   # the loss columns
+                                                                    # (older runs have no energy column: shown as 0)
     columns["step"] = np.array([int(r["step"]) for r in rows])      # training step of each line
     columns["stage"] = [r["stage"] for r in rows]                   # calm / tilt / stone
     return columns
@@ -82,7 +85,7 @@ def plot_panels(run_dir: Path) -> Path:
 
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 9, "axes.edgecolor": GRID,
                          "axes.labelcolor": SECONDARY_INK, "xtick.color": SECONDARY_INK, "ytick.color": SECONDARY_INK})
-    figure, axes = plt.subplots(3, 3, figsize=(13, 9.5), facecolor=SURFACE, sharex=True)
+    figure, axes = plt.subplots(2, 5, figsize=(19, 7.5), facecolor=SURFACE, sharex=True)
     for ax, (column, title) in zip(axes.flat, PANELS):              # one panel per term
         values = data[column]
         ax.set_facecolor(SURFACE)
@@ -125,7 +128,7 @@ def plot_panels(run_dir: Path) -> Path:
 
 
 def plot_combined(run_dir: Path) -> Path:
-    """All nine curves in one graph, on one logarithmic axis."""
+    """All ten curves in one graph, on one logarithmic axis."""
     data = read_log(run_dir / "log.csv")                            # the numbers
     steps = data["step"]
     window = max(1, len(steps) // 40)                               # smooth over ~2.5 % of the run
@@ -178,7 +181,7 @@ def plot_combined(run_dir: Path) -> Path:
 
 def plot(run_dir: Path) -> Path:
     """Write both pictures; returns the path of the single-graph one."""
-    plot_panels(run_dir)                                            # nine panels
+    plot_panels(run_dir)                                            # ten panels
     return plot_combined(run_dir)                                   # one graph
 
 

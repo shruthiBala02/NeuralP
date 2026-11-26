@@ -101,7 +101,8 @@ class Simulation:
                            phi=self.water.phi[indices])              # the water now
         box = BoxInputs(solid_mask=self.solid, stone_mask=stone_mask, stone_velocity_field=stone_velocity_field,
                         tilt=self.tilt[indices], tilt_rate=self.tilt_rate[indices],
-                        tilt_acceleration=self.tilt_acceleration[indices])   # walls, stone, tilt
+                        tilt_acceleration=self.tilt_acceleration[indices],
+                        initial_volume=self.initial_volume[indices])   # walls, stone, tilt, the volume to keep
         return state, box
 
     # --------------------------------------------------------------------------------------------------
@@ -112,9 +113,23 @@ class Simulation:
         self.water.potential[indices] = next_water.potential.detach()   # keep the prediction (no gradients in the pool)
         self.water.pressure[indices] = next_water.pressure.detach()
         self.water.phi[indices] = next_water.phi.detach()
+        self._redistance_when_due(indices)                          # keep phi a true distance (eq. 6), every few steps
         self._advance_tilt(indices)                                 # the box turns towards its target
         self._advance_stones(indices, next_water)                   # Newton + Morison + contacts
         self.steps_since_reset[indices] += 1                        # one step older
+
+    def _redistance_when_due(self, indices):
+        """Every REDISTANCE_EVERY steps of a scene: make phi a true distance again (eq. 6, exact), then restore the
+        volume exactly (eq. 7) - re-distancing may shift the surface by a hair."""
+        indices = torch.as_tensor(indices, device=self.device)      # (a list or a tensor)
+        due = indices[(self.steps_since_reset[indices] + 1) % eq.REDISTANCE_EVERY == 0]   # scenes whose turn it is
+        if len(due) == 0:
+            return
+        s = self.stones                                             # shorter name
+        stone_mask, _ = stone_fields(self.positions, s.centre[due], s.velocity[due], s.spin[due], s.radius[due], s.active[due])
+        phi = eq.redistance(self.water.phi[due], self.solid, self.h)   # |grad phi| = 1 again
+        fluid = (1.0 - self.solid) * (1.0 - stone_mask)             # cells that can hold water
+        self.water.phi[due] = eq.restore_volume(phi, fluid, self.initial_volume[due], self.h)   # the same amount of water
 
     def _advance_tilt(self, indices):
         gain = TILT_GAIN_PER_SECOND * self.scales.time              # the same 4 per second as the viewer, dimensionless

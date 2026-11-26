@@ -20,6 +20,7 @@ COLUMNS = [                                                         # (loss name
     ("no penetration (eq. 10)", "pen(10)"),
     ("wall law (eq. 11)", "wall(11)"),
     ("stone boundary (eq. 13)", "stone(13)"),
+    ("energy (rule)", "energy"),
 ]
 HEADER_EVERY = 20                                                   # repeat the column titles every 20 rows
 

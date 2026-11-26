@@ -110,6 +110,15 @@ def upwind_advection(scalar, velocity_c, h):
     return total
 
 
+def worst_mean(values, weight, fraction):
+    """Average of the largest `fraction` of the values where weight > 0 (e.g. the worst 1 % of the faces)."""
+    chosen = values[weight > 0]                                     # only where the equation applies
+    if chosen.numel() == 0:
+        return values.sum() * 0.0                                   # nothing to check (keeps the graph)
+    count = max(1, int(fraction * chosen.numel()))                  # how many count as "worst"
+    return chosen.topk(count).values.mean()                         # their average
+
+
 def masked_mean(values, weight):
     weight = weight.expand_as(values)                               # same shape as the values
     return (weight * values).sum() / (weight.sum() + 1e-8)          # average only where the equation applies
@@ -142,6 +151,148 @@ def divergence_of_velocity(velocity, h):                            # used only 
 #   would wrongly lower the pressure just below the surface and upset the balance with gravity).
 def apply_free_surface_pressure(pressure, phi, h):
     return pressure * (phi > 0).float()                            # pressure is switched off above the water
+
+
+# Eq. 10  WALL NO-PENETRATION, built in:   u.n_w = 0 on every wall, the floor and the lid
+#   The flow through a wall face is the circulation of A around that face (u = curl A). It is exactly zero if the
+#   components of A lying IN the wall plane are zero there. So after every network step those components are set
+#   to 0 on the six wall planes: no water can pass through a wall, whatever the network outputs. The network still
+#   controls everything else (also the flow along the walls). Layout: A_x[i,j,k] lives at (x_i, y_j+h/2, z_k+h/2),
+#   A_y at (x_i+h/2, y_j, z_k+h/2), A_z at (x_i+h/2, y_j+h/2, z_k); the wall planes are at index 0 and n-2.
+def wall_potential_mask(size, device):
+    nx, ny, nz = size                                               # cells along x, y, z (with the wall layer)
+    mask = torch.ones(1, 3, nx, ny, nz, device=device)              # 1 = keep
+    for index in (0, nx - 2):                                       # the two x-wall planes (x = x_0 + h/2, x_{n-2} + h/2)
+        mask[:, 1, index], mask[:, 2, index] = 0.0, 0.0             # A_y, A_z lie in them
+    for index in (0, ny - 2):                                       # floor and lid
+        mask[:, 0, :, index], mask[:, 2, :, index] = 0.0, 0.0       # A_x, A_z lie in them
+    for index in (0, nz - 2):                                       # front and back walls
+        mask[:, 0, :, :, index], mask[:, 1, :, :, index] = 0.0, 0.0  # A_x, A_y lie in them
+    return mask
+
+
+# Eq. 5  SURFACE TRANSPORT, built in:   d(phi)/dt + u.grad(phi) = 0
+#   The surface is not predicted by the network: it is CARRIED by the water velocity exactly, the way the classical
+#   solver does it (semi-Lagrangian: follow the flow back for one time step, RK2, and read phi there). So water
+#   can only be where the flow carried it: it can't appear out of nothing, vanish, or jump into the air.
+#   Everything is in "index units": cell (i, j, k) has its centre at index coordinates (i, j, k).
+def sample_trilinear(field, gx, gy, gz):
+    """field (B, 1, X, Y, Z) read at fractional index positions gx, gy, gz (B, 1, X, Y, Z): trilinear."""
+    batch, _, nx, ny, nz = field.shape                              # sizes
+    gx, gy, gz = gx.clamp(0, nx - 1), gy.clamp(0, ny - 1), gz.clamp(0, nz - 1)   # stay inside the grid
+    ix = gx.floor().clamp(max=nx - 2)                               # lower corner of the surrounding cube
+    iy = gy.floor().clamp(max=ny - 2)
+    iz = gz.floor().clamp(max=nz - 2)
+    fx, fy, fz = gx - ix, gy - iy, gz - iz                          # position inside the cube (0..1), keeps the gradient
+    ix, iy, iz = ix.long(), iy.long(), iz.long()
+    flat = field.reshape(batch, -1)                                 # (B, X*Y*Z) for gathering
+    total = 0.0                                                     # weighted sum of the 8 corners
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                n = ((ix + dx) * ny + (iy + dy)) * nz + (iz + dz)   # flat index of this corner
+                value = torch.gather(flat, 1, n.reshape(batch, -1)).reshape(gx.shape)
+                weight = (fx if dx else 1 - fx) * (fy if dy else 1 - fy) * (fz if dz else 1 - fz)
+                total = total + weight * value
+    return total
+
+
+def velocity_at(velocity, gx, gy, gz):
+    """The face velocity (B, 3, X, Y, Z) read at index positions (cell centres at integers): u_x lives half a cell
+    further along x than the cell centre, u_y along y, u_z along z."""
+    ux = sample_trilinear(velocity[:, 0:1], gx - 0.5, gy, gz)       # x-faces are at i + 1/2
+    uy = sample_trilinear(velocity[:, 1:2], gx, gy - 0.5, gz)       # y-faces at j + 1/2
+    uz = sample_trilinear(velocity[:, 2:3], gx, gy, gz - 0.5)       # z-faces at k + 1/2
+    return ux, uy, uz
+
+
+def copy_walls_from_inside(field):
+    """Wall cells take the value of the nearest inside cell (zero gradient across the walls), as the classical solver.
+    A copy can never grow (a straight-line continuation into the walls fed back on itself and blew up in the corners)."""
+    field = torch.cat([field[:, :, 1:2], field[:, :, 1:-1], field[:, :, -2:-1]], dim=2)          # x-walls
+    field = torch.cat([field[:, :, :, 1:2], field[:, :, :, 1:-1], field[:, :, :, -2:-1]], dim=3)  # floor and lid
+    return torch.cat([field[..., 1:2], field[..., 1:-1], field[..., -2:-1]], dim=4)              # front and back
+
+
+def carry_surface(phi, velocity, h, dt):
+    """phi one time step later, carried by `velocity` (faces, dimensionless): semi-Lagrangian, RK2 backtrace."""
+    batch, _, nx, ny, nz = phi.shape
+    device = phi.device
+    gx = torch.arange(nx, device=device, dtype=phi.dtype).view(1, 1, -1, 1, 1).expand(batch, 1, nx, ny, nz)   # cell centres
+    gy = torch.arange(ny, device=device, dtype=phi.dtype).view(1, 1, 1, -1, 1).expand(batch, 1, nx, ny, nz)
+    gz = torch.arange(nz, device=device, dtype=phi.dtype).view(1, 1, 1, 1, -1).expand(batch, 1, nx, ny, nz)
+    step = dt / h                                                   # velocity -> cells per time step
+    ux, uy, uz = velocity_at(velocity, gx, gy, gz)                  # velocity at the cell centre
+    mx, my, mz = gx - 0.5 * step * ux, gy - 0.5 * step * uy, gz - 0.5 * step * uz   # half a step back (RK2 midpoint)
+    ux, uy, uz = velocity_at(velocity, mx, my, mz)                  # velocity there
+    bx, by, bz = gx - step * ux, gy - step * uy, gz - step * uz     # where this water was one step ago
+    return copy_walls_from_inside(sample_trilinear(phi, bx, by, bz))   # phi from there; walls copy the inside
+
+
+# Eq. 7  VOLUME CONSERVATION, built in:   sum of H(phi) h^3 = V_0
+#   Carrying phi on a grid loses (or gains) a little water at every step - classical level-set solvers correct this
+#   too. Here the whole surface is shifted up or down by the exact amount that restores the volume V_0 (the same
+#   smoothed H as everywhere else). The volume grows steadily with the shift, so a bisection search ALWAYS finds it,
+#   whatever state the water is in (even a wildly broken one); two Newton steps then polish it and let the gradient
+#   flow through. Water can never disappear. fluid = cells that hold water.
+VOLUME_BISECTION_STEPS = 24                                         # halves the search range 24 times (~1e-6 of a cell)
+VOLUME_NEWTON_STEPS = 2                                             # polish (and keep the step differentiable)
+
+
+def water_volume_shifted(phi, fluid, shift, h):
+    """Volume (B,) if the surface were shifted by `shift` (B,)."""
+    return (smoothed_step(phi + shift.view(-1, 1, 1, 1, 1), h) * fluid).sum(dim=(1, 2, 3, 4)) * h ** 3
+
+
+def restore_volume(phi, fluid, target_volume, h):
+    batch, _, nx, ny, nz = phi.shape
+    with torch.no_grad():                                           # 1. bisection: find the shift, safely
+        reach = (nx + ny + nz) * h                                  # far enough to make everything air (or water)
+        low = torch.full((batch,), -reach, device=phi.device)       # volume(low) <= V_0
+        high = torch.full((batch,), reach, device=phi.device)       # volume(high) >= V_0
+        for _ in range(VOLUME_BISECTION_STEPS):
+            middle = 0.5 * (low + high)                             # try the middle
+            too_little = water_volume_shifted(phi, fluid, middle, h) < target_volume   # still too little water?
+            low = torch.where(too_little, middle, low)              # then the answer is above the middle
+            high = torch.where(too_little, high, middle)            # otherwise below
+        phi_shifted = phi + (0.5 * (low + high)).view(-1, 1, 1, 1, 1)   # (no gradient through the search)
+    phi = phi + (phi_shifted - phi).detach()                        # the same values, with the gradient of phi kept
+    for _ in range(VOLUME_NEWTON_STEPS):                            # 2. Newton: polish and let the gradient through
+        H = smoothed_step(phi, h)                                   # 0 in air .. 1 in water
+        volume = (H * fluid).sum(dim=(1, 2, 3, 4)) * h ** 3         # volume now
+        slope = (H * (1.0 - H) / (0.75 * h) * fluid).sum(dim=(1, 2, 3, 4)) * h ** 3   # d(volume)/d(shift)
+        phi = phi + ((target_volume - volume) / slope.clamp(min=1e-6)).view(-1, 1, 1, 1, 1)   # Newton step
+    return phi
+
+
+# Eq. 6  EIKONAL, built in:   |grad(phi)| = 1
+#   Carrying phi bends it away from the surface. Every few steps phi is made a true distance again (re-distancing,
+#   Godunov upwind, exactly as the classical solver's kernel). It never moves the surface on purpose, only tidies phi
+#   away from it (a tiny shift of the surface is undone by restore_volume afterwards). Not physics: maintenance of phi.
+REDISTANCE_EVERY = 4                                                # steps between re-distancings (as the classical solver)
+REDISTANCE_ITERATIONS = 3                                           # pseudo-time steps each time (as the classical solver)
+
+
+def godunov_gradient_size(phi, sign, h):
+    """|grad phi| with one-sided (upwind) differences, Godunov's rule: the classical choice for |grad phi| = 1."""
+    gradient_squared = torch.zeros_like(phi)                        # sum over the three directions
+    for d in (X, Y, Z):
+        backward = (phi - previous_cell(phi, d)) / h                # one-sided differences
+        forward = (next_cell(phi, d) - phi) / h
+        water_side = torch.maximum(backward.clamp(min=0) ** 2, forward.clamp(max=0) ** 2)   # upwind, phi > 0
+        air_side = torch.maximum(backward.clamp(max=0) ** 2, forward.clamp(min=0) ** 2)     # upwind, phi < 0
+        gradient_squared = gradient_squared + torch.where(sign > 0, water_side, air_side)
+    return torch.sqrt(gradient_squared + 1e-12)
+
+
+def redistance(phi, solid_mask, h, iterations=REDISTANCE_ITERATIONS):
+    sign = phi / torch.sqrt(phi ** 2 + h * h)                       # smoothed sign of the starting phi
+    inside = solid_mask == 0                                        # walls are copied, not updated
+    for _ in range(iterations):
+        size = godunov_gradient_size(phi, sign, h)                  # |grad phi| (upwind)
+        updated = phi - 0.5 * h * sign * (size - 1.0)               # one pseudo-time step towards |grad phi| = 1
+        phi = copy_walls_from_inside(torch.where(inside, updated, phi))   # walls copy the nearest inside cell
+    return phi
 
 
 # ======================================================================================================
@@ -277,9 +428,10 @@ def level_set_residual(phi_now, phi_next, u_mid_c, solid_mask, h, dt):
 
 # Eq. 6  EIKONAL:   |grad(phi)| = 1
 #   Keeps phi a true distance so the surface stays sharp (a mathematical tool, not physics). Checked EVERYWHERE
-#   except inside the walls, so phi can't form bumps (and new "water") far from the surface.
+#   except inside the walls, so phi can't form bumps (and new "water") far from the surface. |grad phi| is measured
+#   the same way re-distancing makes it 1 (one-sided, Godunov), so the walls that copy the inside don't disturb it.
 def eikonal_residual(phi_next, solid_mask, h):
-    gradient_size = torch.sqrt((gradient_at_centres(phi_next, h) ** 2).sum(dim=1, keepdim=True) + 1e-12)   # |grad phi|
+    gradient_size = godunov_gradient_size(phi_next, phi_next, h)    # |grad phi| (upwind; the sign of phi picks the side)
     everywhere = torch.ones_like(phi_next) * (1.0 - solid_mask)     # every cell except the walls
     return gradient_size - 1.0, everywhere
 
@@ -358,7 +510,37 @@ def stone_boundary_residual(u_next, stone_velocity_field, stone_mask, solid_mask
     return torch.cat(residuals, dim=1), torch.cat(weights, dim=1)
 
 
+# ENERGY RULE:   dE/dt <= 0 when nothing drives the water
+#   E = sum over the water of (1/2 |u|^2 - g_b . x) h^3  (motion + height; rho = 1). Friction can only remove energy,
+#   so when the box is not turning and there is no stone, the energy must not grow. One-sided: only an INCREASE is a
+#   residual (relative to the water volume, per unit time). Stops blow-ups where water speeds up by itself.
+def water_energy(state, positions, gravity, fluid, h):
+    u_c = faces_to_centres(velocity_from_vector_potential(state.potential, h))   # velocity at the cell centres
+    kinetic = 0.5 * (u_c ** 2).sum(dim=1, keepdim=True)             # 1/2 |u|^2
+    height = -(gravity.view(-1, 3, 1, 1, 1) * positions).sum(dim=1, keepdim=True)   # -g_b . x  (potential energy)
+    return (smoothed_step(state.phi, h) * fluid * (kinetic + height)).sum(dim=(1, 2, 3, 4)) * h ** 3   # (B,)
+
+
+def energy_rule_residual(state_now, state_next, box, positions, fluid, initial_volume, h, dt):
+    gravity = gravity_in_box_frame(box.tilt)                        # gravity in the box (constant when not turning)
+    gain = water_energy(state_next, positions, gravity, fluid, h) - water_energy(state_now, positions, gravity, fluid, h)
+    increase = torch.relu(gain) / dt / initial_volume.clamp(min=1e-6)   # only growth counts, per unit volume and time
+    not_turning = (box.tilt_rate.abs() < 1e-3) & (box.tilt_acceleration.abs() < 1e-2)   # the box is (almost) still
+    no_stone = box.stone_mask.flatten(1).sum(dim=1) == 0            # nothing is thrown in
+    return increase, (not_turning & no_stone).float()               # (B,) residual and which scenes it applies to
+
+
+# WORST FACES (momentum): the plain average lets a few bad faces hide - in run v2 the errors in the box corners were
+#   8x larger than elsewhere, but corners are only ~2 % of the faces, so they barely counted. The worst 1 % of the
+#   faces are therefore also added (weight 0.05: for errors spread evenly this adds ~25 %, for errors piled up in a
+#   few places it doubles the push there).
+WORST_FACES_FRACTION = 0.01                                         # the worst 1 % of the water faces
+WORST_FACES_WEIGHT = 0.05                                           # how much their average counts
+
+
 # ALL LOSS EQUATIONS TOGETHER:   L = sum of lambda_i L_i,   L_i = weighted mean of residual_i^2
+#   Eqs. 5, 6, 7 and 10 are built into every step (Section 1), so they are only LOGGED here (weight 0 in train.py),
+#   to show that they hold.
 #   state_now / state_next: objects with .potential, .pressure, .phi (model.WaterState; state_next already has eq. 8)
 #   box: object with .solid_mask, .stone_mask, .stone_velocity_field, .tilt, .tilt_rate, .tilt_acceleration (model.BoxInputs)
 def loss_terms(state_now, state_next, box, positions, initial_volume, h, dt, scales: Scales = Scales()):
@@ -386,9 +568,12 @@ def loss_terms(state_now, state_next, box, positions, initial_volume, h, dt, sca
     wall_law, wall_law_w = wall_law_residual(u_next_c, eddy, h, viscosity, water)                      # eq. 11
     stone, stone_w = stone_boundary_residual(u_next, box.stone_velocity_field, box.stone_mask, box.solid_mask,
                                              water_cells)                                               # eq. 13
+    energy, energy_w = energy_rule_residual(state_now, state_next, box, positions, fluid, initial_volume, h, dt)   # energy rule
 
+    momentum_squared = momentum ** 2                                # per face
     return {                                                        # one number per equation
-        "momentum (eq. 2)": masked_mean(momentum ** 2, momentum_w),
+        "momentum (eq. 2)": masked_mean(momentum_squared, momentum_w)   # the average over all water faces ...
+                            + WORST_FACES_WEIGHT * worst_mean(momentum_squared, momentum_w, WORST_FACES_FRACTION),   # ... + the worst ones
         "level set (eq. 5)": masked_mean(level_set ** 2, level_set_w),
         "eikonal (eq. 6)": masked_mean(eikonal ** 2, eikonal_w),
         "volume (eq. 7)": masked_mean(volume ** 2, volume_w),
@@ -396,6 +581,7 @@ def loss_terms(state_now, state_next, box, positions, initial_volume, h, dt, sca
         "no penetration (eq. 10)": masked_mean(no_penetration ** 2, no_penetration_w),
         "wall law (eq. 11)": masked_mean(wall_law ** 2, wall_law_w),
         "stone boundary (eq. 13)": masked_mean(stone ** 2, stone_w),
+        "energy (rule)": masked_mean(energy ** 2, energy_w),
     }
 
 
@@ -412,6 +598,7 @@ def starting_state(positions, depth, tilt, box_height):
     surface_point = torch.zeros(batch, 3, 1, 1, 1, device=positions.device)   # a point on the surface ...
     surface_point[:, 1, 0, 0, 0] = -box_height / 2 + depth          # ... at height h_0 above the floor, box middle
     phi_0 = (up * (surface_point - positions)).sum(dim=1, keepdim=True)   # signed distance below the surface
+    phi_0 = copy_walls_from_inside(phi_0)                           # wall cells copy the inside (as after every step)
 
     # Eq. 15  STARTING VELOCITY:   u_0 = 0   ->   A_0 = 0
     #   The water starts at rest (the curl of zero is zero).

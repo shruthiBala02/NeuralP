@@ -65,7 +65,7 @@ def network_stages(model, state, box):
     x = net.bottom(x)
     for upsample, block, skip in zip(net.up_samplers, net.up_blocks, reversed(skips)):
         x = block(torch.cat([upsample(x), skip], dim=1))
-    return padded_input, net.output(x)                              # (1, 15, P...) and (1, 5, P...)
+    return padded_input, net.output(x)                              # (1, 15, P...) and (1, 4, P...)
 
 
 def make_test_case(model, settings):
@@ -80,19 +80,24 @@ def make_test_case(model, settings):
     sim.tilt_rate[0], sim.tilt_acceleration[0] = 0.05, -0.3         # the box is turning
     sim.throw_stone(0, (0.4, -0.3, 0.1), (0.5, -1.0, 0.2), 0.16, 2.5)   # a stone under water, moving
     sim.stones.spin[0] = torch.tensor([0.0, 0.0, 3.0])              # and spinning
+    sim.water.potential *= eq.wall_potential_mask(sim.water.phi.shape[2:], "cpu")   # (a state that obeys the wall rule)
     state, box = sim.inputs(index)                                  # what the network reads
     with torch.no_grad():
-        next_state = model(state, box, sim.h)                       # PyTorch's answer
+        next_state = model(state, box, sim.h)                       # PyTorch's answer (network + the strict rules)
         velocity = eq.velocity_from_vector_potential(next_state.potential, sim.h)   # u = curl(A) on the faces
         padded_input, raw_output = network_stages(model, state, box) # two intermediate results, for debugging
+        fluid = (1.0 - box.solid_mask) * (1.0 - box.stone_mask)     # re-distancing + volume, as simulation.py does it
+        redistanced = eq.restore_volume(eq.redistance(next_state.phi, box.solid_mask, sim.h), fluid, box.initial_volume, sim.h)
     arrays = [state.phi, state.potential, state.pressure,           # input
               next_state.phi, next_state.potential, next_state.pressure, velocity,   # expected output
-              padded_input, raw_output]                             # expected intermediate results
+              padded_input, raw_output,                             # expected intermediate results
+              redistanced]                                          # expected phi after re-distancing (every 4th step)
     data = np.concatenate([a[0].numpy().astype(np.float32).ravel() for a in arrays])   # one scene, PyTorch order
     s = sim.stones                                                  # the stone, for the viewer
     description = {"cells": list(state.phi.shape[2:]), "cell_size": sim.h,
                    "order": ["phi", "A(3)", "p", "expected_phi", "expected_A(3)", "expected_p", "expected_u(3)",
-                             "padded_input(15, padded grid)", "raw_output(5, padded grid)"],
+                             "padded_input(15, padded grid)", "raw_output(4, padded grid)", "expected_phi_redistanced"],
+                   "initial_volume": float(box.initial_volume[0]),  # the water volume to keep (eq. 7, dimensionless)
                    "tilt": float(sim.tilt[0]), "tilt_rate": float(sim.tilt_rate[0]),
                    "tilt_acceleration": float(sim.tilt_acceleration[0]),
                    "stone": {"active": True, "centre": s.centre[0].tolist(), "velocity": s.velocity[0].tolist(),
@@ -130,7 +135,10 @@ def main():
                     "group_norm_groups": "min(8, channels)", "group_norm_eps": 1e-5, "activation": "SiLU"},
         "input_order": ["phi", "A_x", "A_y", "A_z", "p", "wall_mask", "stone_mask", "stone_vx", "stone_vy", "stone_vz",
                         "gravity_x", "gravity_y", "gravity_z", "tilt_rate", "tilt_acceleration"],
-        "output_order": ["dA_x", "dA_y", "dA_z", "dp", "dphi"],
+        "output_order": ["dA_x", "dA_y", "dA_z", "dp"],
+        "strict_rules": {"redistance_every": eq.REDISTANCE_EVERY, "redistance_iterations": eq.REDISTANCE_ITERATIONS,
+                         "volume_bisection_steps": eq.VOLUME_BISECTION_STEPS,
+                         "volume_newton_steps": eq.VOLUME_NEWTON_STEPS},
         "grid": {"name": grid.name, "cells_with_walls": list(grid.total_cells(scales.box)), "cell_size_m": grid.cell_size},
         "time_step_s": settings["time_step_seconds"],
         "scales": {"length_m": scales.length, "speed_m_s": scales.speed, "time_s": scales.time,

@@ -3,6 +3,14 @@ model.py  -  the physics neural solver network
 
 One 3D U-Net that steps the water forward in time:
     water now (A, p, phi) + walls + stone + tilt   ->   water one time step later (A, p, phi)
+The network predicts the FLOW (change of A) and the pressure (change of p). Strict rules are then applied exactly,
+so they hold whatever the network outputs (hard constraints, not things to learn):
+    eq. 1   incompressible:          u = curl A
+    eq. 10  no flow through walls:   A's in-wall components are 0 on the wall planes
+    eq. 5   surface moves with the water: phi is carried by the flow (semi-Lagrangian), not predicted
+    eq. 7   volume constant:         the surface is shifted to restore the starting volume exactly
+    eq. 8   no pressure in the air
+(eq. 6, phi a true distance, is restored every few steps by the simulation: simulation.py)
 
 Inspired by:
     U-Net             Ronneberger, Fischer & Brox, MICCAI 2015
@@ -10,7 +18,7 @@ Inspired by:
     physics-only CNN  Wandel, Weinmann & Klein, ICLR 2021 and Physics of Fluids 2021
                       (network predicts the CHANGE of the state; the vector potential is shifted to zero mean)
 
-The built-in constraints come from physical_equations.py (eq. 1: u = curl A, eq. 8: p = 0 above the water).
+All the rules come from physical_equations.py.
 """
 
 from dataclasses import dataclass                                   # small containers for the inputs and outputs
@@ -19,6 +27,7 @@ import torch                                                        # tensors an
 import torch.nn as nn                                               # neural-network layers
 import torch.nn.functional as F                                     # padding and pooling functions
 
+from config import Scales                                           # reference scales (for the default time step)
 from physics_neural_solver import physical_equations as eq          # all equations live there
 
 
@@ -40,10 +49,11 @@ class BoxInputs:                                                    # everything
     tilt: torch.Tensor                                              # (B,) tilt angle in radians (+ raises the right end)
     tilt_rate: torch.Tensor                                         # (B,) tilt speed  Omega_z
     tilt_acceleration: torch.Tensor                                 # (B,) its rate of change  dOmega_z/dt
+    initial_volume: torch.Tensor = None                             # (B,) water volume to keep (eq. 7); None = keep the current one
 
 
 INPUT_CHANNELS = 15                                                 # phi 1 + A 3 + p 1 + walls 1 + stone 1 + stone velocity 3 + gravity 3 + tilt rate 1 + tilt acceleration 1
-OUTPUT_CHANNELS = 5                                                 # change of A (3), change of p (1), change of phi (1)
+OUTPUT_CHANNELS = 4                                                 # change of A (3), change of p (1)  (phi is carried, not predicted)
 
 NETWORK_SIZES = {                                                   # base number of channels (doubles at every level down)
     "small": 16,                                                    # ~1.4 million weights
@@ -122,7 +132,7 @@ class WaterUNet3D(nn.Module):
             self.up_samplers.append(nn.ConvTranspose3d(channels[level + 1], channels[level], kernel_size=2, stride=2))  # learned upsampling x2
             self.up_blocks.append(ConvBlock(2 * channels[level], channels[level]))  # merge with the skip connection
 
-        self.output = nn.Conv3d(channels[0], OUTPUT_CHANNELS, kernel_size=1)    # 1x1 convolution to the 5 outputs
+        self.output = nn.Conv3d(channels[0], OUTPUT_CHANNELS, kernel_size=1)    # 1x1 convolution to the 4 outputs
         nn.init.zeros_(self.output.weight)                          # start at zero: an untrained network predicts "no change"
         nn.init.zeros_(self.output.bias)                            # (a stable starting point for training)
 
@@ -145,7 +155,7 @@ class WaterUNet3D(nn.Module):
             x = upsample(x)                                         # double the grid
             x = block(torch.cat([x, skip], dim=1))                  # merge with the fine detail from the way down
 
-        x = self.output(x)                                          # 5 output channels
+        x = self.output(x)                                          # 4 output channels
         return x[:, :, :size[0], :size[1], :size[2]]                # remove the padding again
 
 
@@ -155,18 +165,27 @@ class WaterUNet3D(nn.Module):
 class PhysicsNeuralSolver(nn.Module):
     """One time step of the water:  state at time n  ->  state at time n+1."""
 
-    def __init__(self, network_size: str = "medium", depth: int = 3):
+    def __init__(self, network_size: str = "medium", depth: int = 3, time_step: float = None):
         super().__init__()                                          # set up the PyTorch module
         self.network = WaterUNet3D(NETWORK_SIZES[network_size], depth)   # the 3D U-Net
+        self.time_step = time_step if time_step is not None else (1.0 / 60.0) / Scales().time   # dt (dimensionless), one frame
 
     def forward(self, state: WaterState, box: BoxInputs, cell_size: float) -> WaterState:
-        change = self.network(network_input(state, box)).float()    # predicted change of A, p, phi (float32 for the physics)
+        change = self.network(network_input(state, box)).float()    # predicted change of A and p (float32 for the physics)
 
         change_potential = change[:, 0:3]                           # change of the vector potential A
         change_potential = change_potential - change_potential.mean(dim=(2, 3, 4), keepdim=True)  # A is only defined up to a constant: keep its mean fixed
-        potential_next = state.potential + change_potential         # new A  (u = curl A is incompressible: eq. 1)
+        wall_mask = eq.wall_potential_mask(state.phi.shape[2:], state.phi.device)   # 0 for A's in-wall components
+        potential_next = (state.potential + change_potential) * wall_mask   # new A: incompressible (eq. 1), no flow through walls (eq. 10)
 
-        phi_next = state.phi + change[:, 4:5]                       # new level set: the new water surface
+        u_mid = 0.5 * (eq.velocity_from_vector_potential(state.potential, cell_size)   # the water velocity during the step
+                       + eq.velocity_from_vector_potential(potential_next, cell_size))  # (average of now and next, as in the loss)
+        phi_next = eq.carry_surface(state.phi, u_mid, cell_size, self.time_step)   # the surface moves with the water (eq. 5)
+        fluid = (1.0 - box.solid_mask) * (1.0 - box.stone_mask)     # cells that can hold water
+        target = box.initial_volume                                 # the volume to keep ...
+        if target is None:                                          # ... or, if not given, the volume right now
+            target = (eq.smoothed_step(state.phi, cell_size) * fluid).sum(dim=(1, 2, 3, 4)) * cell_size ** 3
+        phi_next = eq.restore_volume(phi_next, fluid, target, cell_size)   # exactly the same amount of water (eq. 7)
 
         pressure_next = state.pressure + change[:, 3:4]             # new pressure, before the surface condition
         pressure_next = eq.apply_free_surface_pressure(pressure_next, phi_next, cell_size)  # p = 0 above the water (eq. 8)

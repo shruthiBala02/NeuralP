@@ -22,7 +22,7 @@ def test_frozen_water_fails_the_water_tests(tmp_path, monkeypatch):
     try:
         run = tmp_path / "outputs" / "runs" / "frozen"
         run.mkdir(parents=True)
-        torch.save({"model": PhysicsNeuralSolver("small").state_dict(), "settings": asdict(TrainingSettings()),
+        torch.save({"model": PhysicsNeuralSolver("small").state_dict(), "settings": asdict(TrainingSettings(network_size="small")),
                     "step": 0}, run / "checkpoint.pt")              # an untrained network: the water never moves
         monkeypatch.setattr(sys, "argv", ["evaluate", "--run", "frozen", "--quick", "--device", "cpu"])
         evaluate.main()

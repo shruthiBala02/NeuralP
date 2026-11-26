@@ -274,18 +274,26 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 }`;
 
 // ---------------------------------------------------------------------------------------------------------------
-// Apply the network output (model.PhysicsNeuralSolver.forward):  A += dA - mean(dA),  phi += dphi,
-//                                                                p = (p + dp) if phi_new > 0 else 0   (eq. 8)
+// Apply the network output (model.PhysicsNeuralSolver.forward):
+//   A = (A + dA - mean(dA)) x wall mask    (eq. 1 + eq. 10: A's in-wall components are 0 on the six wall planes)
+//   p = p + dp                             (the air is set to 0 later, after the surface has moved: MASK_PRESSURE)
 // ---------------------------------------------------------------------------------------------------------------
 export const APPLY_CHANGE = /* wgsl */ `
 struct Params { nx: u32, ny: u32, nz: u32, p0: u32, px: u32, py: u32, pz: u32, p1: u32 };
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> change: array<f32>;
 @group(0) @binding(2) var<storage, read> mean: array<f32>;
-@group(0) @binding(3) var<storage, read_write> phi: array<f32>;
-@group(0) @binding(4) var<storage, read_write> potential: array<f32>;
-@group(0) @binding(5) var<storage, read_write> pressure: array<f32>;
+@group(0) @binding(3) var<storage, read_write> potential: array<f32>;
+@group(0) @binding(4) var<storage, read_write> pressure: array<f32>;
 ${INDEX}
+fn inWallPlane(c: u32, x: u32, y: u32, z: u32) -> bool {       // eq. 10: this component of A lies in a wall plane
+  let xw = x == 0u || x == P.nx - 2u;                          // the x-wall planes (index 0 and n-2)
+  let yw = y == 0u || y == P.ny - 2u;                          // floor and lid
+  let zw = z == 0u || z == P.nz - 2u;                          // front and back
+  if (c == 0u) { return yw || zw; }                            // A_x lies in floor/lid and front/back planes
+  if (c == 1u) { return xw || zw; }                            // A_y in the x-walls and front/back
+  return xw || yw;                                             // A_z in the x-walls and floor/lid
+}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
   let cells = P.nx * P.ny * P.nz;
@@ -295,11 +303,196 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
   let padded = P.px * P.py * P.pz;
   let p_index = (x * P.py + y) * P.pz + z;                     // the same cell in the padded output
   for (var c = 0u; c < 3u; c = c + 1u) {
-    potential[c * cells + index] = potential[c * cells + index] + change[c * padded + p_index] - mean[c];
+    let a = potential[c * cells + index] + change[c * padded + p_index] - mean[c];
+    potential[c * cells + index] = select(a, 0.0, inWallPlane(c, x, y, z));
   }
-  let new_phi = phi[index] + change[4u * padded + p_index];
-  phi[index] = new_phi;
-  pressure[index] = select(0.0, pressure[index] + change[3u * padded + p_index], new_phi > 0.0);
+  pressure[index] = pressure[index] + change[3u * padded + p_index];
+}`;
+
+// Shared by the strict-rule kernels below
+const GRID = /* wgsl */ `
+struct Grid { nx: u32, ny: u32, nz: u32, axis: u32, h: f32, dt: f32, p0: f32, p1: f32 };`;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Eq. 5 built in: the surface is CARRIED by the water (semi-Lagrangian, RK2), u = (u_now + u_next) / 2.
+// Index units: cell (i, j, k) has its centre at (i, j, k); u_x lives at i + 1/2, u_y at j + 1/2, u_z at k + 1/2.
+// (physical_equations.carry_surface / velocity_at / sample_trilinear)
+// ---------------------------------------------------------------------------------------------------------------
+export const CARRY_SURFACE = /* wgsl */ `
+${GRID}
+@group(0) @binding(0) var<uniform> G: Grid;
+@group(0) @binding(1) var<storage, read> phi: array<f32>;
+@group(0) @binding(2) var<storage, read> u_now: array<f32>;
+@group(0) @binding(3) var<storage, read> u_next: array<f32>;
+@group(0) @binding(4) var<storage, read_write> phi_out: array<f32>;
+${INDEX}
+fn trilinear(which: u32, c: u32, g_in: vec3<f32>) -> f32 {     // which: 0 = phi, 1 = u_now, 2 = u_next; c = component
+  let n = vec3<f32>(f32(G.nx), f32(G.ny), f32(G.nz));
+  let g = clamp(g_in, vec3<f32>(0.0), n - 1.0);                // stay inside the grid
+  let i0 = min(floor(g), n - 2.0);                             // lower corner of the surrounding cube
+  let f = g - i0;                                              // position inside the cube
+  let base = c * G.nx * G.ny * G.nz;
+  var total = 0.0;
+  for (var dx = 0u; dx < 2u; dx = dx + 1u) {
+    for (var dy = 0u; dy < 2u; dy = dy + 1u) {
+      for (var dz = 0u; dz < 2u; dz = dz + 1u) {
+        let i = u32(i0.x) + dx; let j = u32(i0.y) + dy; let k = u32(i0.z) + dz;
+        let n_index = base + (i * G.ny + j) * G.nz + k;
+        var value = 0.0;
+        if (which == 0u) { value = phi[n_index]; } else if (which == 1u) { value = u_now[n_index]; } else { value = u_next[n_index]; }
+        let w = select(1.0 - f.x, f.x, dx == 1u) * select(1.0 - f.y, f.y, dy == 1u) * select(1.0 - f.z, f.z, dz == 1u);
+        total = total + w * value;
+      }
+    }
+  }
+  return total;
+}
+fn velocityAt(g: vec3<f32>) -> vec3<f32> {                     // u_mid at index position g
+  let gx = g - vec3<f32>(0.5, 0.0, 0.0); let gy = g - vec3<f32>(0.0, 0.5, 0.0); let gz = g - vec3<f32>(0.0, 0.0, 0.5);
+  return 0.5 * vec3<f32>(trilinear(1u, 0u, gx) + trilinear(2u, 0u, gx),
+                         trilinear(1u, 1u, gy) + trilinear(2u, 1u, gy),
+                         trilinear(1u, 2u, gz) + trilinear(2u, 2u, gz));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+  let cells = G.nx * G.ny * G.nz;
+  let index = threadIndex(gid, groups);
+  if (index >= cells) { return; }
+  let g = vec3<f32>(f32(index / (G.ny * G.nz)), f32((index / G.nz) % G.ny), f32(index % G.nz));   // this cell centre
+  let cells_per_step = G.dt / G.h;                             // velocity -> cells per time step
+  let mid = g - 0.5 * cells_per_step * velocityAt(g);          // half a step back (RK2 midpoint)
+  let back = g - cells_per_step * velocityAt(mid);             // where this water was one step ago
+  phi_out[index] = trilinear(0u, 0u, back);                    // phi from there
+}`;
+
+// Wall cells copy the nearest inside cell (one axis per dispatch, x then y then z, like copy_walls_from_inside)
+export const COPY_WALLS_FROM_INSIDE = /* wgsl */ `
+${GRID}
+@group(0) @binding(0) var<uniform> G: Grid;
+@group(0) @binding(1) var<storage, read_write> field: array<f32>;
+${INDEX}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+  let index = threadIndex(gid, groups);
+  if (index >= G.nx * G.ny * G.nz) { return; }
+  let cell = vec3<u32>(index / (G.ny * G.nz), (index / G.nz) % G.ny, index % G.nz);
+  let n = vec3<u32>(G.nx, G.ny, G.nz);
+  let a = cell[G.axis];                                        // position along this axis
+  if (a != 0u && a != n[G.axis] - 1u) { return; }              // only the two wall layers of this axis
+  var inside = cell;                                           // the nearest inside cell
+  if (a == 0u) { inside[G.axis] = 1u; } else { inside[G.axis] = n[G.axis] - 2u; }
+  field[index] = field[(inside.x * G.ny + inside.y) * G.nz + inside.z];
+}`;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Eq. 7 built in: water volume and the Newton shift that restores it (one workgroup sums the whole grid).
+// stats[0] = volume, stats[1] = d(volume)/d(shift), stats[2] = shift.  (physical_equations.restore_volume)
+// ---------------------------------------------------------------------------------------------------------------
+export const VOLUME_SUM = /* wgsl */ `
+struct Params {
+  nx: u32, ny: u32, nz: u32, stone_active: u32, px: u32, py: u32, pz: u32, p0: u32,
+  h: f32, half_x: f32, half_y: f32, half_z: f32,
+  gravity: vec3<f32>, tilt_rate: f32, stone_centre: vec3<f32>, tilt_acceleration: f32,
+  stone_velocity: vec3<f32>, stone_radius: f32, stone_spin: vec3<f32>, p1: f32,
+};
+@group(0) @binding(0) var<uniform> P: Params;
+@group(0) @binding(1) var<storage, read> phi: array<f32>;
+@group(0) @binding(2) var<storage, read> target_volume: array<f32>;
+@group(0) @binding(3) var<storage, read_write> stats: array<f32>;
+var<workgroup> volume_part: array<f32, 256>;
+var<workgroup> slope_part: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let cells = P.nx * P.ny * P.nz;
+  var v = 0.0; var s = 0.0;
+  for (var index = lid.x; index < cells; index = index + 256u) {
+    let x = index / (P.ny * P.nz); let y = (index / P.nz) % P.ny; let z = index % P.nz;
+    if (x == 0u || y == 0u || z == 0u || x == P.nx - 1u || y == P.ny - 1u || z == P.nz - 1u) { continue; }   // walls
+    let position = (vec3<f32>(f32(x), f32(y), f32(z)) - 0.5) * P.h - vec3<f32>(P.half_x, P.half_y, P.half_z);
+    if (P.stone_active == 1u && length(position - P.stone_centre) < P.stone_radius) { continue; }      // inside the stone
+    let H = 0.5 * (1.0 + tanh(phi[index] / (1.5 * P.h)));      // smoothed step
+    v = v + H;
+    s = s + H * (1.0 - H) / (0.75 * P.h);
+  }
+  volume_part[lid.x] = v; slope_part[lid.x] = s;
+  var stride = 128u;
+  loop {
+    workgroupBarrier();
+    if (lid.x < stride) {
+      volume_part[lid.x] = volume_part[lid.x] + volume_part[lid.x + stride];
+      slope_part[lid.x] = slope_part[lid.x] + slope_part[lid.x + stride];
+    }
+    if (stride == 1u) { break; }
+    stride = stride / 2u;
+  }
+  if (lid.x == 0u) {
+    let cube = P.h * P.h * P.h;
+    let volume = volume_part[0] * cube;
+    let slope = slope_part[0] * cube;
+    stats[0] = volume; stats[1] = slope;
+    stats[2] = (target_volume[0] - volume) / max(slope, 1e-6);   // Newton step
+  }
+}`;
+
+// add the Newton shift to every cell (the whole surface moves up or down)
+export const SHIFT = /* wgsl */ `
+${GRID}
+@group(0) @binding(0) var<uniform> G: Grid;
+@group(0) @binding(1) var<storage, read> stats: array<f32>;
+@group(0) @binding(2) var<storage, read_write> phi: array<f32>;
+${INDEX}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+  let index = threadIndex(gid, groups);
+  if (index >= G.nx * G.ny * G.nz) { return; }
+  phi[index] = phi[index] + stats[2];
+}`;
+
+// eq. 8: no pressure in the air (after the surface has moved)
+export const MASK_PRESSURE = /* wgsl */ `
+${GRID}
+@group(0) @binding(0) var<uniform> G: Grid;
+@group(0) @binding(1) var<storage, read> phi: array<f32>;
+@group(0) @binding(2) var<storage, read_write> pressure: array<f32>;
+${INDEX}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+  let index = threadIndex(gid, groups);
+  if (index >= G.nx * G.ny * G.nz) { return; }
+  pressure[index] = select(0.0, pressure[index], phi[index] > 0.0);
+}`;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Eq. 6 built in: one re-distancing pseudo-step (Godunov upwind, as physical_equations.redistance). Inside cells only;
+// the walls copy the inside afterwards (COPY_WALLS_FROM_INSIDE). sign_source = phi before this re-distancing.
+// ---------------------------------------------------------------------------------------------------------------
+export const REDISTANCE = /* wgsl */ `
+${GRID}
+@group(0) @binding(0) var<uniform> G: Grid;
+@group(0) @binding(1) var<storage, read> phi: array<f32>;
+@group(0) @binding(2) var<storage, read> sign_source: array<f32>;
+@group(0) @binding(3) var<storage, read_write> phi_out: array<f32>;
+${INDEX}
+fn at(x: u32, y: u32, z: u32) -> f32 { return phi[(x * G.ny + y) * G.nz + z]; }
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+  let index = threadIndex(gid, groups);
+  if (index >= G.nx * G.ny * G.nz) { return; }
+  let x = index / (G.ny * G.nz); let y = (index / G.nz) % G.ny; let z = index % G.nz;
+  let f = phi[index];
+  if (x == 0u || y == 0u || z == 0u || x == G.nx - 1u || y == G.ny - 1u || z == G.nz - 1u) { phi_out[index] = f; return; }
+  let s0 = sign_source[index];
+  let s = s0 / sqrt(s0 * s0 + G.h * G.h);                      // smoothed sign
+  let backward = vec3<f32>(f - at(x - 1u, y, z), f - at(x, y - 1u, z), f - at(x, y, z - 1u)) / G.h;
+  let forward = vec3<f32>(at(x + 1u, y, z) - f, at(x, y + 1u, z) - f, at(x, y, z + 1u) - f) / G.h;
+  var g2 = 0.0;
+  for (var d = 0u; d < 3u; d = d + 1u) {
+    let b = backward[d]; let fw = forward[d];
+    let water_side = max(max(b, 0.0) * max(b, 0.0), min(fw, 0.0) * min(fw, 0.0));
+    let air_side = max(min(b, 0.0) * min(b, 0.0), max(fw, 0.0) * max(fw, 0.0));
+    g2 = g2 + select(air_side, water_side, s > 0.0);
+  }
+  phi_out[index] = f - 0.5 * G.h * s * (sqrt(g2) - 1.0);
 }`;
 
 // ---------------------------------------------------------------------------------------------------------------

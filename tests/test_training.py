@@ -13,6 +13,7 @@ from physics_neural_solver import physical_equations as eq          # the loss
 from physics_neural_solver.model import PhysicsNeuralSolver, WaterState   # the network
 from physics_neural_solver.train import (TrainingSettings, importance_at, learning_rate_at, stage_at, throw_speed_at,
                                          train, weighted_total)
+from scene import water_volume                                      # volume (eq. 7)
 from physics_neural_solver.training_pool import STONE_FREE_FRACTION, TrainingPool   # training states
 
 DT = (1 / 60) / Scales().time                                       # one frame, dimensionless
@@ -106,10 +107,35 @@ def test_stone_weight_fades_in_and_throws_start_slow():
     assert abs(throw_speed_at(settings.total_steps, settings, scales) * scales.speed - 3.0) < 1e-9   # 3 m/s at the end
 
 
-def test_losing_one_percent_of_the_water_costs_as_much_as_the_other_equations():
+def test_strict_rules_hold_over_many_steps_in_the_pool():
+    # a random (untrained) network moving the water for 24 steps, with tilting and stones: whatever it does,
+    # the water volume stays exact (also across the re-distancings every 4 steps) and nothing flows through a wall
+    torch.manual_seed(0)
+    pool = TrainingPool(4, COARSE, "cpu", DT, seed=2)
+    pool.set_stage("stone")
+    pool._new_tilt_targets(torch.arange(4))                         # start tilting
+    pool._throw_stones(torch.arange(2, 4))                          # and throw two stones
+    model = PhysicsNeuralSolver("small")
+    torch.nn.init.normal_(model.network.output.weight, std=0.05)    # make it move the water
+    sim = pool.simulation
+    for _ in range(24):
+        indices = torch.arange(4)
+        state, box = sim.inputs(indices)
+        with torch.no_grad():
+            sim.advance(indices, model(state, box, sim.h))          # (advance, not put_back: no random resets)
+        volume = water_volume(sim.water.phi, sim.solid, box.stone_mask, sim.h)   # measured with the stone where it was
+        assert ((volume - sim.initial_volume).abs() / sim.initial_volume).max() < 1e-5   # during this step: eq. 7, exact
+        u = eq.velocity_from_vector_potential(sim.water.potential, sim.h)
+        through_walls, _ = eq.no_penetration_residual(u)
+        assert through_walls.abs().max() < 1e-5                     # eq. 10, every step
+
+
+def test_exact_rules_have_no_weight_in_the_loss():
     importance = TrainingSettings().importance
-    cost = importance["volume (eq. 7)"] * 0.01 ** 2                 # eq. 7 residual = relative error, squared
-    assert 0.005 < cost < 0.05                                      # ~0.01: comparable to the other terms in training
+    for name in ("level set (eq. 5)", "eikonal (eq. 6)", "volume (eq. 7)", "no penetration (eq. 10)"):
+        assert importance[name] == 0.0                              # built in: nothing left to learn (only logged)
+    for name in ("momentum (eq. 2)", "no shear (eq. 9)", "wall law (eq. 11)", "stone boundary (eq. 13)", "energy (rule)"):
+        assert importance[name] > 0.0                               # learned
 
 
 def test_weighted_total_uses_the_importance():
@@ -123,7 +149,10 @@ def test_schedule_and_stages():
     assert stage_at(settings.stage_steps["calm"], settings.stage_steps) == "tilt"
     assert stage_at(settings.total_steps - 1, settings.stage_steps) == "stone"
     assert abs(learning_rate_at(0, settings) - settings.learning_rate) < 1e-12
-    assert abs(learning_rate_at(settings.total_steps, settings) - settings.final_learning_rate) < 1e-12
+    end_of_cycle = settings.restart_every - 1                       # the last step before a kept copy
+    assert abs(learning_rate_at(end_of_cycle, settings) - settings.final_learning_rate) < 1e-8   # lowest at the save
+    assert abs(learning_rate_at(settings.restart_every, settings) - settings.learning_rate) < 1e-12   # then restarted
+    assert abs(learning_rate_at(settings.total_steps - 1, settings) - settings.final_learning_rate) < 1e-8   # lowest at the end
 
 
 def test_network_learns_the_hydrostatic_pressure_from_the_physics_alone():
@@ -163,14 +192,16 @@ def test_training_runs_and_resumes(tmp_path):
     here = os.getcwd()
     os.chdir(tmp_path)                                              # write outputs into a temporary folder
     try:
-        settings = TrainingSettings(run_name="t", pool_size=4, batch_size=2, device="cpu",
+        settings = TrainingSettings(run_name="t", network_size="small", pool_size=4, batch_size=2, device="cpu",
                                     stage_steps={"calm": 3, "tilt": 3, "stone": 3})
-        settings.log_every, settings.checkpoint_every = 3, 3
+        settings.log_every, settings.checkpoint_every, settings.keep_every, settings.plot_every = 3, 3, 3, 3
         train(settings)                                             # 9 steps
         checkpoint = torch.load("outputs/runs/t/checkpoint.pt", weights_only=False)
         assert checkpoint["step"] == 9
         assert torch.load("outputs/runs/t/checkpoint_end_of_calm.pt", weights_only=False)["step"] == 3   # stage checkpoints
         assert torch.load("outputs/runs/t/checkpoint_end_of_tilt.pt", weights_only=False)["step"] == 6
+        for kept in (3, 6, 9):                                      # a permanent copy every keep_every steps
+            assert torch.load(f"outputs/runs/t/checkpoint_step_{kept}.pt", weights_only=False)["step"] == kept
         settings.stage_steps = {"calm": 3, "tilt": 3, "stone": 6}   # 3 more steps
         train(settings, resume=True)
         assert torch.load("outputs/runs/t/checkpoint.pt", weights_only=False)["step"] == 12
