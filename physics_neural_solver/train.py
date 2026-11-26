@@ -83,11 +83,16 @@ def weighted_total(terms: dict, importance: dict) -> torch.Tensor:
 # Helpers
 # ------------------------------------------------------------------------------------------------------
 def pick_device(choice: str) -> torch.device:
-    if choice != "auto":                                            # the user chose
+    """The GPU, always - unless the CPU is chosen on purpose with --device cpu.
+    Training on the CPU by accident would be extremely slow, so with "auto" and no GPU visible we stop instead."""
+    if choice != "auto":                                            # chosen on purpose
         return torch.device(choice)
     if torch.cuda.is_available():                                   # NVIDIA GPU (the cluster)
+        torch.backends.cudnn.benchmark = True                       # let cuDNN pick the fastest 3D convolutions
         return torch.device("cuda")
-    return torch.device("cpu")                                      # otherwise the CPU (Apple MPS lacks some 3D ops)
+    raise SystemExit("No GPU is visible to PyTorch, so training will NOT start (it would be far too slow on the CPU).\n"
+                     "Check:  nvidia-smi   and   python check_environment.py   (are you on a GPU node? is the\n"
+                     "environment activated?). To train on the CPU anyway, add  --device cpu")
 
 
 def precision_context(precision: str, device: torch.device):

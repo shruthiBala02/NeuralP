@@ -97,6 +97,8 @@ def main():
     parser.add_argument("--quick", action="store_true", help="tiny run to check the code")
     args = parser.parse_args()
     device = torch.device(args.device)
+    if device.type != "cuda":                                       # make it obvious when the GPU is not used
+        print("NOTE: no GPU - this benchmark runs on the CPU, so its times say nothing about GPU training.", flush=True)
 
     grids = ["coarse"] if args.quick else ["coarse", "fine"]        # what to measure
     networks = ["small"] if args.quick else ["small", "medium", "large"]
