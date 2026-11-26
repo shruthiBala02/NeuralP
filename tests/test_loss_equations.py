@@ -141,9 +141,59 @@ def test_wall_law_is_zero_without_flow(geometry):
 def test_stone_boundary(geometry):
     positions, solid, h = geometry
     stone_mask = ((positions - torch.tensor([0.0, -0.3, 0.0]).view(1, 3, 1, 1, 1)).norm(dim=1, keepdim=True) < 0.2).float()
-    stone_velocity = torch.zeros(1, 3, *positions.shape[2:])
-    stone_velocity[:, 1] = -0.5 * stone_mask[:, 0]                  # the stone moves down
-    residual, weight = eq.stone_boundary_residual(stone_velocity.clone(), stone_velocity, stone_mask, solid)
-    assert float(eq.masked_mean((residual ** 2).sum(1, keepdim=True), weight)) == 0   # water moving with the stone: 0
-    residual, weight = eq.stone_boundary_residual(torch.zeros_like(stone_velocity), stone_velocity, stone_mask, solid)
-    assert float(eq.masked_mean((residual ** 2).sum(1, keepdim=True), weight)) > 0.2  # water ignoring the stone: detected
+    field = torch.zeros(1, 3, *positions.shape[2:])
+    field[:, 1:2] = -0.5 * stone_mask                               # the stone moves down at 0.5
+    water_with_stone = torch.zeros_like(field)
+    water_with_stone[:, 1] = -0.5                                   # water everywhere moving with it (on every face)
+    residual, weight = eq.stone_boundary_residual(water_with_stone, field, stone_mask, solid)
+    assert float(eq.masked_mean(residual ** 2, weight)) < 1e-12     # water moving with the stone: 0
+    residual, weight = eq.stone_boundary_residual(torch.zeros_like(field), field, stone_mask, solid)
+    assert float(eq.masked_mean(residual ** 2, weight)) > 0.05      # water ignoring the stone (flows through it): detected
+    assert float(weight[:, 1:2][..., :].sum()) > float(stone_mask.sum())   # boundary faces are checked, not only the inside
+
+
+def test_turning_deep_water_into_air_is_caught_by_the_surface_equation(geometry):
+    positions, solid, h = geometry
+    phi_now = 0.0 - positions[:, 1:2]                               # surface at y = 0 (25 cm of water)
+    phi_next = phi_now.clone()
+    deep = (positions[:, 1:2] < -0.6) & (positions[:, 0:1].abs() < 0.3)   # a patch of deep water ...
+    phi_next[deep] = -0.5                                           # ... suddenly marked as air (a cheat)
+    still = torch.zeros(1, 3, *positions.shape[2:])                 # no flow that could explain it
+    residual, weight = eq.level_set_residual(phi_now, phi_next, still, solid, h, 0.1)
+    assert float(eq.masked_mean(residual ** 2, weight)) > 1.0       # the surface equation notices
+
+
+def test_calm_water_with_a_resting_stone_satisfies_every_equation(geometry):
+    positions, solid, h = geometry
+    state, box = calm_scene(positions, solid, 0.25, 0.0)
+    centre = torch.tensor([[0.5, -1.0 + 0.16, 0.0]])                # a stone resting on the floor, under water
+    from scene import stone_fields
+    stone_mask, stone_velocity = stone_fields(positions, centre, torch.zeros(1, 3), torch.zeros(1, 3),
+                                              torch.tensor([0.16]), torch.tensor([True]))
+    box = BoxInputs(solid, stone_mask, stone_velocity, box.tilt, box.tilt_rate, box.tilt_acceleration)
+    volume = water_volume(state.phi, solid, stone_mask, h)
+    terms = eq.loss_terms(state, state, box, positions, volume, h, dt=0.1)
+    for name, value in terms.items():
+        assert float(value) < 1e-4, f"{name} = {float(value)} with a resting stone (should be ~0)"
+
+
+def test_water_turning_with_the_box_needs_the_centrifugal_force(geometry):
+    positions, solid, h = geometry
+    rate = 1.0                                                      # a fast, steady rotation (to make the effect clear)
+    x, y = positions[:, 0:1], positions[:, 1:2]
+    gravity = eq.gravity_in_box_frame(torch.zeros(1))               # level box
+    pressure_field = -y + 0.5 * rate ** 2 * (x ** 2 + y ** 2)       # hydrostatic in the rotating frame: grad p = g + w^2 r
+    pressure_field = pressure_field - pressure_field.min() + 0.2    # positive everywhere (the box full of water)
+    phi = torch.full_like(pressure_field, 10.0)                     # no free surface nearby
+    u = torch.zeros(1, 3, *positions.shape[2:])                     # at rest relative to the box
+    faces = torch.ones_like(u)
+    inner = (slice(None), slice(None), slice(2, -2), slice(2, -2), slice(2, -2))
+
+    def momentum(with_rotation):
+        residual, _, _ = eq.momentum_residual(u, u, pressure_field, phi, faces, positions, gravity,
+                                              torch.tensor([rate if with_rotation else 0.0]), torch.zeros(1),
+                                              h, 0.1, 1e-6, Scales().water)
+        return float((residual[inner] ** 2).mean())
+
+    assert momentum(with_rotation=True) < 1e-3 * rate ** 4          # balanced: gravity + centrifugal = pressure gradient
+    assert momentum(with_rotation=False) > 0.1 * rate ** 4          # without the centrifugal force: not balanced

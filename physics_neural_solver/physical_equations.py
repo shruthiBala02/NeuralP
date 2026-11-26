@@ -257,12 +257,14 @@ def momentum_residual(u_now, u_next, pressure_next, phi_mid, water_faces, positi
 
 
 # Eq. 5  LEVEL-SET TRANSPORT:   d(phi)/dt + u.grad(phi) = 0
-#   phi = level set, u = velocity. The surface moves with the water. Checked near the surface (|phi| < 3 cells).
+#   phi = level set, u = velocity. The surface moves with the water. Checked in ALL the water and in a thin band
+#   (3 cells) above it - not only near the surface: otherwise the network could turn deep water into "air" without
+#   this equation noticing. Not checked in the far air, where the velocity has no meaning.
 def level_set_residual(phi_now, phi_next, u_mid_c, solid_mask, h, dt):
     phi_mid = 0.5 * (phi_now + phi_next)                            # IMEX average
     residual = (phi_next - phi_now) / dt + upwind_advection(phi_mid, u_mid_c, h)   # d(phi)/dt + u.grad(phi)
-    near_surface = (phi_mid.abs() < 3.0 * h).float() * (1.0 - solid_mask)          # band around the surface, no walls
-    return residual, near_surface
+    water_and_band = (torch.maximum(phi_now, phi_next) > -3.0 * h).float() * (1.0 - solid_mask)   # water (now or next) + 3 cells above, no walls
+    return residual, water_and_band
 
 
 # Eq. 6  EIKONAL:   |grad(phi)| = 1
@@ -325,9 +327,20 @@ def wall_law_residual(u_next_c, eddy_viscosity, h, viscosity, water: WaterConsta
 
 # Eq. 13  WATER-STONE BOUNDARY CONDITION:   u = [V_s + omega_s x (x - x_s)] - [Omega x x]   on the stone
 #   V_s, omega_s, x_s = stone velocity, spin, centre; Omega x x = the box's own motion. The scene provides this
-#   difference as `stone_velocity_field`. Water can't pass through the stone and moves with it.
-def stone_boundary_residual(u_next_c, stone_velocity_field, stone_mask, solid_mask):
-    return u_next_c - stone_velocity_field, stone_mask * (1.0 - solid_mask)   # checked inside the stone cells
+#   difference as `stone_velocity_field` (at the stone's cell centres). Water can't pass through the stone and moves
+#   with it. Checked on every cell FACE that touches a stone cell (as the classical solver does), using the stone's
+#   velocity from the stone side of the face.
+def stone_boundary_residual(u_next, stone_velocity_field, stone_mask, solid_mask):
+    residuals, weights = [], []                                     # one per velocity component
+    for axis, d in enumerate((X, Y, Z)):                            # x-, y-, z-faces
+        stone_here, stone_next = stone_mask, next_cell(stone_mask, d)   # is each side of the face stone?
+        field = stone_velocity_field[:, axis:axis + 1]              # stone velocity, this component
+        target = torch.where(stone_here > 0, field, next_cell(field, d))   # take it from the stone side
+        touching = torch.maximum(stone_here, stone_next)            # the face touches the stone
+        open_face = (1.0 - solid_mask) * (1.0 - next_cell(solid_mask, d))   # not a wall face
+        residuals.append(u_next[:, axis:axis + 1] - target)         # water velocity - stone velocity
+        weights.append(touching * open_face)
+    return torch.cat(residuals, dim=1), torch.cat(weights, dim=1)
 
 
 # ALL LOSS EQUATIONS TOGETHER:   L = sum of lambda_i L_i,   L_i = weighted mean of residual_i^2
@@ -356,7 +369,7 @@ def loss_terms(state_now, state_next, box, positions, initial_volume, h, dt, sca
     no_shear, no_shear_w = no_shear_residual(u_next_c, state_next.phi, box.solid_mask, h)              # eq. 9
     no_penetration, no_penetration_w = no_penetration_residual(u_next)                                 # eq. 10
     wall_law, wall_law_w = wall_law_residual(u_next_c, eddy, h, viscosity, water)                      # eq. 11
-    stone, stone_w = stone_boundary_residual(u_next_c, box.stone_velocity_field, box.stone_mask, box.solid_mask)   # eq. 13
+    stone, stone_w = stone_boundary_residual(u_next, box.stone_velocity_field, box.stone_mask, box.solid_mask)     # eq. 13
 
     return {                                                        # one number per equation
         "momentum (eq. 2)": masked_mean(momentum ** 2, momentum_w),
@@ -366,7 +379,7 @@ def loss_terms(state_now, state_next, box, positions, initial_volume, h, dt, sca
         "no shear (eq. 9)": masked_mean((no_shear ** 2).sum(dim=1, keepdim=True), no_shear_w),
         "no penetration (eq. 10)": masked_mean(no_penetration ** 2, no_penetration_w),
         "wall law (eq. 11)": masked_mean(wall_law ** 2, wall_law_w),
-        "stone boundary (eq. 13)": masked_mean((stone ** 2).sum(dim=1, keepdim=True), stone_w),
+        "stone boundary (eq. 13)": masked_mean(stone ** 2, stone_w),
     }
 
 
