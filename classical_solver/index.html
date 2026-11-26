@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>neuralP: 3D water in a tilting box (classical solver)</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #dfe7ee; font-family: system-ui, sans-serif; }
+    #message { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+               white-space: pre-wrap; text-align: center; color: #222; font-size: 15px; pointer-events: none; }
+    #message[hidden] { display: none; }
+    #message.error { color: #a00; background: rgba(255,255,255,0.85); }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="message">Starting the WebGPU water solver…</div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

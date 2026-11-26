@@ -1,0 +1,5 @@
+# PyTorch built for CUDA 12.8 (needed by the Blackwell RTX PRO 6000 / RTX 5090)
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.7
+numpy        # writing the exported weights
+pytest       # running the tests in tests/
