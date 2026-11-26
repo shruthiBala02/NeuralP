@@ -3,11 +3,13 @@ plot_losses.py  -  draw how every loss term changes during training
 
     python -m physics_neural_solver.plot_losses --run coarse_small      # reads outputs/runs/coarse_small/log.csv
 
-Writes outputs/runs/<run>/losses.png: nine small panels - the total loss and each of the 8 equations - each with
-its own logarithmic axis (the terms differ by orders of magnitude, so one shared axis would hide most of them).
-In every panel: the faint line is every logged value, the solid line is a smoothed version, the thin vertical
-lines mark where the curriculum stages (calm -> tilt -> stone) begin, and the number at the end is the latest value.
-train.py also calls this at every checkpoint, so the picture stays up to date while training runs.
+Writes two pictures into outputs/runs/<run>/:
+    losses.png               ONE graph: the total loss (thick black) and the 8 equations (one colour each), smoothed,
+                             on one logarithmic axis; thin vertical lines mark the curriculum stages (calm -> tilt -> stone)
+    losses_by_equation.png   the same nine curves in separate panels (each with its own axis), with every logged value
+A term that is exactly 0 (e.g. the water-stone loss before any stone is thrown) cannot be drawn on a log axis,
+so its line starts when it first becomes non-zero.
+train.py also calls this at every checkpoint, so the pictures stay up to date while training runs.
 """
 
 import argparse                                                     # command-line options
@@ -24,6 +26,8 @@ INK = "#0b0b0b"                                                     # titles and
 SECONDARY_INK = "#52514e"                                           # axis labels and tick labels
 GRID = "#e4e3df"                                                    # hairline grid, one step off the background
 LINE = "#2a78d6"                                                    # the data (one series per panel)
+EQUATION_COLOURS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",      # one fixed colour per equation (eqs. 2, 5, 6, 7,
+                    "#e87ba4", "#008300", "#6250d6", "#e34948"]      #  9, 10, 11, 13), never re-ordered
 
 PANELS = [                                                          # (column in log.csv, panel title)
     ("total", "Total loss (weighted sum)"),
@@ -70,7 +74,7 @@ def stage_starts(steps, stages):
     return starts
 
 
-def plot(run_dir: Path) -> Path:
+def plot_panels(run_dir: Path) -> Path:
     data = read_log(run_dir / "log.csv")                            # the numbers
     steps = data["step"]
     window = max(1, len(steps) // 40)                               # smooth over ~2.5 % of the run
@@ -114,17 +118,77 @@ def plot(run_dir: Path) -> Path:
     figure.text(0.01, 0.945, "faint line: every logged value   solid line: smoothed   vertical lines: start of a "
                 "curriculum stage   number: latest value", ha="left", fontsize=8.5, color=SECONDARY_INK)
     figure.tight_layout(rect=(0, 0, 0.985, 0.93))
-    out_path = run_dir / "losses.png"
+    out_path = run_dir / "losses_by_equation.png"
     figure.savefig(out_path, dpi=140, facecolor=SURFACE)
     plt.close(figure)
     return out_path
+
+
+def plot_combined(run_dir: Path) -> Path:
+    """All nine curves in one graph, on one logarithmic axis."""
+    data = read_log(run_dir / "log.csv")                            # the numbers
+    steps = data["step"]
+    window = max(1, len(steps) // 40)                               # smooth over ~2.5 % of the run
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10, "axes.edgecolor": GRID,
+                         "axes.labelcolor": SECONDARY_INK, "xtick.color": SECONDARY_INK, "ytick.color": SECONDARY_INK})
+    figure, ax = plt.subplots(figsize=(12, 6.5), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+
+    curves = []                                                     # (latest value, label, line) for the legend order
+    for (column, title), colour in zip(PANELS, ["#0b0b0b"] + EQUATION_COLOURS):   # total in black, then the equations
+        values = data[column]
+        positive = values > 0                                       # a log axis cannot show zeros
+        if not positive.any():
+            curves.append((0.0, f"{title}  (0 so far)", None))      # still listed in the legend
+            continue
+        x, y = steps[positive], smooth(values[positive], window)    # smoothed curve
+        width = 2.4 if column == "total" else 1.6                   # the total stands out
+        (line,) = ax.plot(x, y, color=colour, linewidth=width, zorder=3 if column == "total" else 2)
+        curves.append((float(y[-1]), f"{title}   {values[positive][-1]:.1e}", line))
+
+    for step, stage in stage_starts(steps, data["stage"])[1:]:      # stage boundaries
+        ax.axvline(step, color="#bdbcb6", linewidth=0.8, zorder=0)
+    for step, stage in stage_starts(steps, data["stage"]):          # stage names along the top
+        ax.text(step, 1.0, f" {stage}", transform=ax.get_xaxis_transform(), va="bottom", fontsize=9, color=SECONDARY_INK)
+
+    ax.set_yscale("log")
+    ax.grid(True, which="major", color=GRID, linewidth=0.6, linestyle="-")   # solid hairline grid
+    ax.set_axisbelow(True)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    ax.set_xlabel("training step")
+    ax.set_ylabel("loss (log scale)")
+
+    curves.sort(key=lambda item: -item[0])                          # legend from the highest to the lowest latest value
+    handles = [line if line is not None else plt.Line2D([], [], color="none") for _, _, line in curves]
+    legend = ax.legend(handles, [label for _, label, _ in curves], loc="upper left", bbox_to_anchor=(1.01, 1.0),
+                       frameon=False, fontsize=9, labelcolor=INK, handlelength=2.2,
+                       title="latest value (smoothed curves)", title_fontsize=9)
+    legend.get_title().set_color(SECONDARY_INK)
+    legend._legend_box.align = "left"
+
+    figure.suptitle(f"Training losses - run '{run_dir.name}', {steps[-1]:,} steps", x=0.01, y=0.98, ha="left",
+                    color=INK, fontsize=12)
+    figure.tight_layout(rect=(0, 0, 1, 0.95))
+    out_path = run_dir / "losses.png"
+    figure.savefig(out_path, dpi=140, facecolor=SURFACE, bbox_inches="tight")
+    plt.close(figure)
+    return out_path
+
+
+def plot(run_dir: Path) -> Path:
+    """Write both pictures; returns the path of the single-graph one."""
+    plot_panels(run_dir)                                            # nine panels
+    return plot_combined(run_dir)                                   # one graph
 
 
 def main():
     parser = argparse.ArgumentParser(description="Plot the training losses of a run.")
     parser.add_argument("--run", default="coarse_small", help="run name under outputs/runs/")
     args = parser.parse_args()
-    print(f"Wrote {plot(Path('outputs/runs') / args.run)}")
+    run_dir = Path("outputs/runs") / args.run
+    plot(run_dir)
+    print(f"Wrote {run_dir / 'losses.png'} and {run_dir / 'losses_by_equation.png'}")
 
 
 if __name__ == "__main__":

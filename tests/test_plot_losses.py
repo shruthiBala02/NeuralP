@@ -16,7 +16,9 @@ def test_plot_is_written_from_a_log(tmp_path):
             values[-1] = 0.0 if stage != "stone" else 1e-3          # the stone term is 0 before stones exist
             writer.writerow([i * 50, stage] + values)
     image = plot(tmp_path)
-    assert image.exists() and image.stat().st_size > 20_000         # a real picture was written
+    assert image.exists() and image.stat().st_size > 20_000         # the single graph (losses.png)
+    panels = tmp_path / "losses_by_equation.png"
+    assert panels.exists() and panels.stat().st_size > 20_000       # the nine-panel version
 
 
 def test_smoothing_keeps_a_constant_constant():
