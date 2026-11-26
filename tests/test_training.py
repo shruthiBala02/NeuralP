@@ -106,6 +106,12 @@ def test_stone_weight_fades_in_and_throws_start_slow():
     assert abs(throw_speed_at(settings.total_steps, settings, scales) * scales.speed - 3.0) < 1e-9   # 3 m/s at the end
 
 
+def test_losing_one_percent_of_the_water_costs_as_much_as_the_other_equations():
+    importance = TrainingSettings().importance
+    cost = importance["volume (eq. 7)"] * 0.01 ** 2                 # eq. 7 residual = relative error, squared
+    assert 0.005 < cost < 0.05                                      # ~0.01: comparable to the other terms in training
+
+
 def test_weighted_total_uses_the_importance():
     total = weighted_total({"a": torch.tensor(2.0), "b": torch.tensor(3.0)}, {"a": 1.0, "b": 20.0})
     assert float(total) == 62.0                                     # 1 x 2 + 20 x 3

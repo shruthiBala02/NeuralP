@@ -56,7 +56,9 @@ class TrainingSettings:
     final_learning_rate: float = 2e-5                               # ... at the end (cosine decay)
     gradient_clip: float = 1.0                                      # largest allowed gradient size (stability)
     importance: dict = field(default_factory=lambda: {              # how much each equation matters after balancing
-        "momentum (eq. 2)": 1.0, "level set (eq. 5)": 1.0, "eikonal (eq. 6)": 0.1, "volume (eq. 7)": 1.0,
+        "momentum (eq. 2)": 1.0, "level set (eq. 5)": 1.0, "eikonal (eq. 6)": 0.1, "volume (eq. 7)": 100.0,   # volume x100:
+        # its residual is a relative error, squared - at x1, losing 3 % of the water cost only 0.0009 and the water drained
+        # away (run v2). At x100, 1 % lost costs ~0.01, as much as the other equations.
         "no shear (eq. 9)": 0.1, "no penetration (eq. 10)": 20.0, "wall law (eq. 11)": 1.0,
         "stone boundary (eq. 13)": 1.0})                            # fixed weights; walls x20 as in Wandel et al. Stone x1:
                                                                     # at x20 it swamped all water equations (first run)

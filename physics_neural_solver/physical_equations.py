@@ -257,15 +257,22 @@ def momentum_residual(u_now, u_next, pressure_next, phi_mid, water_faces, positi
 
 
 # Eq. 5  LEVEL-SET TRANSPORT:   d(phi)/dt + u.grad(phi) = 0
-#   phi = level set, u = velocity. The surface moves with the water. Checked EVERYWHERE except inside the walls:
-#   in the water (otherwise deep water could be turned into "air" unnoticed) and in all of the air (otherwise phi
-#   could slowly rise far above the surface, unchecked, and become new "water" out of nothing). In the air, u is the
-#   water velocity carried upwards by eq. 9, as classical level-set solvers do.
+#   phi = level set, u = velocity. The surface moves with the water. Checked only in a narrow band around the surface
+#   (SURFACE_BAND_CELLS on each side, now or at the next step): that is where it decides how the surface moves.
+#   Away from the surface phi is only a distance to the surface (kept by eq. 6) and must NOT follow the water: water
+#   that squeezes sideways (exactly what sloshing does) would stretch a transported phi, and eq. 6 forbids stretching,
+#   so checking both everywhere stops the water from sloshing (runs v1 and v2). Classical level-set solvers do the
+#   same: transport near the surface, re-distancing elsewhere ("local level set", Peng et al. 1999).
+#   A surface that appears anywhere (water made from nothing, or deep water turned into air) has phi ~ 0 next to it,
+#   so it falls inside the band and is checked; a sudden jump is also caught by eq. 6 and eq. 7.
+SURFACE_BAND_CELLS = 2.0                                            # half-width of the band, in cells
+
+
 def level_set_residual(phi_now, phi_next, u_mid_c, solid_mask, h, dt):
     phi_mid = 0.5 * (phi_now + phi_next)                            # IMEX average
     residual = (phi_next - phi_now) / dt + upwind_advection(phi_mid, u_mid_c, h)   # d(phi)/dt + u.grad(phi)
-    everywhere = torch.ones_like(phi_now) * (1.0 - solid_mask)      # every cell except the walls
-    return residual, everywhere
+    near_surface = torch.minimum(phi_now.abs(), phi_next.abs()) < SURFACE_BAND_CELLS * h   # surface nearby, now or next
+    return residual, near_surface.float() * (1.0 - solid_mask)      # band around the surface, no walls
 
 
 # Eq. 6  EIKONAL:   |grad(phi)| = 1

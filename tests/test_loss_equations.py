@@ -171,11 +171,35 @@ def test_making_water_far_up_in_the_air_is_caught(geometry):
     phi_next = phi_now.clone()
     high = (positions[:, 1:2] > 0.6) & (positions[:, 0:1].abs() < 0.5)   # a patch of air 6+ cells above the surface ...
     phi_next[high] += 0.2                                           # ... where phi creeps up towards "water" (a cheat)
-    still = torch.zeros(1, 3, *positions.shape[2:])                 # no flow that could explain it
-    residual, weight = eq.level_set_residual(phi_now, phi_next, still, solid, h, 0.1)
-    assert float(eq.masked_mean(residual ** 2, weight)) > 0.05      # the surface equation now checks the far air too
     residual, weight = eq.eikonal_residual(phi_next, solid, h)
-    assert float(eq.masked_mean(residual ** 2, weight)) > 1e-3      # and the bump in phi breaks |grad phi| = 1 there
+    assert float(eq.masked_mean(residual ** 2, weight)) > 1e-3      # the bump in phi breaks |grad phi| = 1 (eq. 6 is everywhere)
+    phi_next[high] = 0.5 * h                                        # if it ever becomes (thin) "water" ...
+    still = torch.zeros(1, 3, *positions.shape[2:])                 # ... with no flow that could explain it
+    residual, weight = eq.level_set_residual(phi_now, phi_next, still, solid, h, 0.1)
+    assert float((weight * (positions[:, 1:2] > 0.6).float()).sum()) > 0   # its new surface is inside the band ...
+    assert float(eq.masked_mean(residual ** 2, weight)) > 1.0       # ... so the surface equation catches it
+
+
+def test_sloshing_is_not_penalised_by_the_surface_equations(geometry):
+    # A standing wave: water squeezes sideways and the surface rises (w grows linearly from the floor to the surface).
+    # phi follows the water at the surface and stays a distance elsewhere, as it should. The old version (eq. 5 in all
+    # the water) punished this honest motion - that is why runs v1 and v2 could not slosh.
+    positions, solid, h = geometry
+    x, y = positions[:, 0:1], positions[:, 1:2]                     # floor at y = -1, surface at y = 0
+    w0, dt = 0.5, 0.1                                               # surface speed, time step
+    u = torch.zeros(1, 3, *positions.shape[2:])
+    u[:, 1:2] = w0 * torch.sin(math.pi * x / 4) * (torch.clamp(y, max=0.0) + 1.0)   # up/down: 0 at the floor, w0 at the top
+    u[:, 0:1] = w0 * (4 / math.pi) * torch.cos(math.pi * x / 4)     # sideways squeeze (div u = 0 in the water)
+    phi_now = 0.0 - y                                               # flat surface
+    phi_next = dt * w0 * torch.sin(math.pi * x / 4) - y             # the surface has moved; phi is again a distance
+    residual, weight = eq.level_set_residual(phi_now, phi_next, u, solid, h, dt)
+    band_loss = float(eq.masked_mean(residual ** 2, weight))        # eq. 5 as it is now
+    all_water = (phi_now > 0).float() * (1.0 - solid)               # eq. 5 as it was (all the water)
+    old_loss = float(eq.masked_mean(residual ** 2, all_water))
+    assert band_loss < 0.01 * w0 ** 2                               # honest sloshing: (almost) no penalty now
+    assert old_loss > 5 * band_loss                                 # the old version punished it
+    residual, weight = eq.eikonal_residual(phi_next, solid, h)
+    assert float(eq.masked_mean(residual ** 2, weight)) < 1e-4      # and phi stays a distance (eq. 6 is happy)
 
 
 def test_made_up_flow_in_the_far_air_is_caught(geometry):
@@ -187,15 +211,18 @@ def test_made_up_flow_in_the_far_air_is_caught(geometry):
     assert float(eq.masked_mean((residual ** 2).sum(dim=1, keepdim=True), weight)) > 1.0   # eq. 9 now covers all the air
 
 
-def test_turning_deep_water_into_air_is_caught_by_the_surface_equation(geometry):
+def test_turning_deep_water_into_air_is_caught(geometry):
     positions, solid, h = geometry
     phi_now = 0.0 - positions[:, 1:2]                               # surface at y = 0 (25 cm of water)
     phi_next = phi_now.clone()
     deep = (positions[:, 1:2] < -0.6) & (positions[:, 0:1].abs() < 0.3)   # a patch of deep water ...
     phi_next[deep] = -0.5                                           # ... suddenly marked as air (a cheat)
-    still = torch.zeros(1, 3, *positions.shape[2:])                 # no flow that could explain it
-    residual, weight = eq.level_set_residual(phi_now, phi_next, still, solid, h, 0.1)
-    assert float(eq.masked_mean(residual ** 2, weight)) > 1.0       # the surface equation notices
+    residual, weight = eq.eikonal_residual(phi_next, solid, h)
+    assert float(eq.masked_mean(residual ** 2, weight)) > 0.05      # phi jumps: |grad phi| = 1 is broken around the patch
+    fluid = 1.0 - solid
+    volume = water_volume(phi_now, solid, torch.zeros_like(phi_now), h)
+    relative, _ = eq.volume_residual(phi_next, fluid, volume, h)
+    assert abs(float(relative)) > 0.01                              # and water has disappeared (eq. 7)
 
 
 def test_calm_water_with_a_resting_stone_satisfies_every_equation(geometry):

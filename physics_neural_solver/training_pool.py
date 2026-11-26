@@ -17,6 +17,7 @@ Keeping the pool healthy (lessons from the first coarse run):
     * a quarter of the scenes never get a stone, so calm water and sloshing are not forgotten in stage "stone"
     * random resets are rare (a scene lives ~500 steps = ~8 s on average), so long runs are practised
     * the throw speed limit can be lowered (train.py starts the stone stage with slow throws)
+    * a new tilt angle only every ~5.5 s on average, so the water also practises sloshing freely and settling
 """
 
 from dataclasses import dataclass                                   # simple containers
@@ -37,9 +38,10 @@ class StageActions:
 
 STAGES = {
     "calm": StageActions(tilt_change=0.0, stone_throw=0.0, reset=0.002),    # level box, no stones
-    "tilt": StageActions(tilt_change=0.01, stone_throw=0.0, reset=0.002),   # random tilting
-    "stone": StageActions(tilt_change=0.01, stone_throw=0.01, reset=0.002), # tilting and stones
-}
+    "tilt": StageActions(tilt_change=0.003, stone_throw=0.0, reset=0.002),  # random tilting, held ~5.5 s on average
+    "stone": StageActions(tilt_change=0.003, stone_throw=0.01, reset=0.002),# tilting and stones
+}                                                                   # (tilt 0.01 = a new angle every 1.7 s: the water
+                                                                    #  never got to slosh freely, one slosh is 1.4 s)
 MAX_VOLUME_ERROR = 0.05                                             # reset a scene whose water volume is off by > 5 %
 MAX_SPEED_M_S = 6.0                                                 # ... or whose water moves faster than 6 m/s anywhere
 STONE_FREE_FRACTION = 0.25                                          # this share of the pool never gets a stone
