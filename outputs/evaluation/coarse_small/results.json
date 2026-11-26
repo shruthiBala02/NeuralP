@@ -1,0 +1,30 @@
+{
+  "still (C1, C5)": {
+    "max_water_speed_m_s": 2.0782748461322345,
+    "max_volume_error": 0.818091630935669,
+    "mean_hydrostatic_pressure_error": 0.4387417733669281,
+    "pass": false
+  },
+  "slosh (C2)": {
+    "period_s": 4.257249172694765,
+    "theory_period_s": 1.397612067260765,
+    "relative_error": 2.046087875470849,
+    "pass": false
+  },
+  "sink (C3)": {
+    "max_sinking_speed_m_s": 1.1042258318494054,
+    "theory_terminal_speed_m_s": 1.7119900264011039,
+    "reached_floor": true,
+    "pass": true
+  },
+  "float (C4)": {
+    "fraction_under_water": 1.0000001192092896,
+    "theory_fraction": 0.5009016229212583,
+    "pass": false
+  },
+  "roll (direction)": {
+    "start_x_m": 0.25,
+    "end_x_m": -0.4650000035762787,
+    "pass": true
+  }
+}
