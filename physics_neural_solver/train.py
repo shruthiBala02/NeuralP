@@ -14,6 +14,7 @@ Each training step:
 
 Output (outputs/runs/<run name>/):
     log.csv          one line every `log_every` steps: every loss term, learning rate, speed
+    losses.png       graph of the total loss and each equation's loss (refreshed at every checkpoint)
     checkpoint.pt    network + optimiser + progress (written every `checkpoint_every` steps and at the end)
     settings.json    the settings of this run
 """
@@ -32,6 +33,7 @@ import torch                                                        # tensors an
 from config import GRIDS, Scales                                    # grids and reference scales
 from physics_neural_solver import physical_equations as eq          # all equations and the loss
 from physics_neural_solver.model import PhysicsNeuralSolver, count_weights   # the network
+from physics_neural_solver.plot_losses import plot as plot_losses  # the loss graph (losses.png)
 from physics_neural_solver.training_pool import TrainingPool        # where the training states come from
 
 
@@ -196,6 +198,10 @@ def train(settings: TrainingSettings, resume: bool = False):
         if (step + 1) % settings.checkpoint_every == 0 or step + 1 == settings.total_steps:   # save progress
             torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step + 1,
                         "settings": asdict(settings)}, checkpoint_path)
+            try:
+                plot_losses(run_dir)                                # refresh losses.png
+            except Exception as error:                              # a plotting problem must never stop training
+                print(f"(could not draw losses.png: {error})")
 
     log_file.close()                                                # done
     print(f"Finished. Checkpoint: {checkpoint_path}   Log: {log_path}")

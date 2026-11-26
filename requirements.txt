@@ -2,4 +2,5 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch>=2.7
 numpy        # writing the exported weights
+matplotlib   # the loss graph (losses.png)
 pytest       # running the tests in tests/
