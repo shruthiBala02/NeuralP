@@ -143,13 +143,48 @@ def test_stone_boundary(geometry):
     stone_mask = ((positions - torch.tensor([0.0, -0.3, 0.0]).view(1, 3, 1, 1, 1)).norm(dim=1, keepdim=True) < 0.2).float()
     field = torch.zeros(1, 3, *positions.shape[2:])
     field[:, 1:2] = -0.5 * stone_mask                               # the stone moves down at 0.5
+    water_cells = ((0.0 - positions[:, 1:2]) > 0).float() * (1 - solid) * (1 - stone_mask)   # surface at y = 0: the stone is under water
     water_with_stone = torch.zeros_like(field)
     water_with_stone[:, 1] = -0.5                                   # water everywhere moving with it (on every face)
-    residual, weight = eq.stone_boundary_residual(water_with_stone, field, stone_mask, solid)
+    residual, weight = eq.stone_boundary_residual(water_with_stone, field, stone_mask, solid, water_cells)
     assert float(eq.masked_mean(residual ** 2, weight)) < 1e-12     # water moving with the stone: 0
-    residual, weight = eq.stone_boundary_residual(torch.zeros_like(field), field, stone_mask, solid)
+    residual, weight = eq.stone_boundary_residual(torch.zeros_like(field), field, stone_mask, solid, water_cells)
     assert float(eq.masked_mean(residual ** 2, weight)) > 0.05      # water ignoring the stone (flows through it): detected
-    assert float(weight[:, 1:2][..., :].sum()) > float(stone_mask.sum())   # boundary faces are checked, not only the inside
+    assert float(weight.sum()) > 0                                  # the faces between the stone and the water are checked
+    inside = stone_mask * eq.next_cell(stone_mask, eq.X)            # x-faces with stone on both sides
+    assert float((weight[:, 0:1] * inside).sum()) == 0              # faces inside the stone are not checked (no water there)
+
+
+def test_stone_in_the_air_is_not_checked(geometry):
+    positions, solid, h = geometry
+    stone_mask = ((positions - torch.tensor([0.0, 0.6, 0.0]).view(1, 3, 1, 1, 1)).norm(dim=1, keepdim=True) < 0.2).float()
+    field = torch.zeros(1, 3, *positions.shape[2:])
+    field[:, 0:1] = 1.9 * stone_mask                                # a stone flying sideways at ~3 m/s, high above the water
+    water_cells = ((0.0 - positions[:, 1:2]) > 0).float() * (1 - solid) * (1 - stone_mask)   # surface at y = 0
+    residual, weight = eq.stone_boundary_residual(torch.zeros_like(field), field, stone_mask, solid, water_cells)
+    assert float(weight.sum()) == 0                                 # no water next to it: the still air is not forced to follow
+
+
+def test_making_water_far_up_in_the_air_is_caught(geometry):
+    positions, solid, h = geometry
+    phi_now = 0.0 - positions[:, 1:2]                               # surface at y = 0
+    phi_next = phi_now.clone()
+    high = (positions[:, 1:2] > 0.6) & (positions[:, 0:1].abs() < 0.5)   # a patch of air 6+ cells above the surface ...
+    phi_next[high] += 0.2                                           # ... where phi creeps up towards "water" (a cheat)
+    still = torch.zeros(1, 3, *positions.shape[2:])                 # no flow that could explain it
+    residual, weight = eq.level_set_residual(phi_now, phi_next, still, solid, h, 0.1)
+    assert float(eq.masked_mean(residual ** 2, weight)) > 0.05      # the surface equation now checks the far air too
+    residual, weight = eq.eikonal_residual(phi_next, solid, h)
+    assert float(eq.masked_mean(residual ** 2, weight)) > 1e-3      # and the bump in phi breaks |grad phi| = 1 there
+
+
+def test_made_up_flow_in_the_far_air_is_caught(geometry):
+    positions, solid, h = geometry
+    phi = 0.0 - positions[:, 1:2]                                   # surface at y = 0, water at rest
+    u = torch.zeros(1, 3, *positions.shape[2:])
+    u[:, 0:1] = 2.0 * (positions[:, 1:2] > 0.5).float()             # a fast wind 5+ cells above the water (made up)
+    residual, weight = eq.no_shear_residual(u, phi, solid, h)
+    assert float(eq.masked_mean((residual ** 2).sum(dim=1, keepdim=True), weight)) > 1.0   # eq. 9 now covers all the air
 
 
 def test_turning_deep_water_into_air_is_caught_by_the_surface_equation(geometry):

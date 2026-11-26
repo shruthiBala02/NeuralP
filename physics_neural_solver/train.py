@@ -16,6 +16,8 @@ Output (outputs/runs/<run name>/):
     log.csv          one line every `log_every` steps: every loss term, learning rate, speed
     losses.png       graph of the total loss and each equation's loss (refreshed at every checkpoint)
     checkpoint.pt    network + optimiser + progress (written every `checkpoint_every` steps and at the end)
+    checkpoint_end_of_calm.pt, checkpoint_end_of_tilt.pt   the network at the end of each stage (evaluate them with
+                     --checkpoint, e.g. to check sloshing before stones were added)
     settings.json    the settings of this run
 """
 
@@ -49,14 +51,18 @@ class TrainingSettings:
     batch_size: int = 16                                            # scenes per training step
     pool_size: int = 256                                            # scenes in the training pool
     time_step_seconds: float = 1.0 / 60.0                           # one network step = one frame at 60 fps
-    stage_steps: dict = field(default_factory=lambda: {"calm": 3000, "tilt": 12000, "stone": 25000})   # curriculum
+    stage_steps: dict = field(default_factory=lambda: {"calm": 3000, "tilt": 17000, "stone": 20000})   # curriculum (tilt longer: it was still improving at 12k)
     learning_rate: float = 5e-4                                     # Adam learning rate at the start
     final_learning_rate: float = 2e-5                               # ... at the end (cosine decay)
     gradient_clip: float = 1.0                                      # largest allowed gradient size (stability)
     importance: dict = field(default_factory=lambda: {              # how much each equation matters after balancing
         "momentum (eq. 2)": 1.0, "level set (eq. 5)": 1.0, "eikonal (eq. 6)": 0.1, "volume (eq. 7)": 1.0,
         "no shear (eq. 9)": 0.1, "no penetration (eq. 10)": 20.0, "wall law (eq. 11)": 1.0,
-        "stone boundary (eq. 13)": 20.0})                           # fixed weights; walls and stone x20, as in Wandel et al.
+        "stone boundary (eq. 13)": 1.0})                            # fixed weights; walls x20 as in Wandel et al. Stone x1:
+                                                                    # at x20 it swamped all water equations (first run)
+    stone_fade_in_steps: int = 3000                                 # the stone weight grows from 0 to its value over this many steps
+    first_throw_speed_m_s: float = 1.0                              # throws start slow (a 3 m/s stone moves 2 cells per step) ...
+    full_throw_speed_after: float = 0.5                             # ... and reach full speed after this share of the stone stage
     precision: str = "tf32"                                         # "fp32", "tf32" or "bf16" (bf16: network only)
     log_every: int = 50                                             # steps between log lines
     checkpoint_every: int = 1000                                    # steps between checkpoints
@@ -71,6 +77,26 @@ class TrainingSettings:
 # ------------------------------------------------------------------------------------------------------
 # Loss: fixed weights
 # ------------------------------------------------------------------------------------------------------
+def importance_at(step: int, settings: TrainingSettings) -> dict:
+    """The weights at this step: the stone weight fades in at the start of the stone stage, so the first
+    (large) water-stone errors don't swamp the water equations."""
+    importance = dict(settings.importance)                          # a copy of the fixed weights
+    stone_start = settings.stage_steps["calm"] + settings.stage_steps["tilt"]   # first step of the stone stage
+    fade = min(max((step - stone_start) / max(settings.stone_fade_in_steps, 1), 0.0), 1.0)   # 0 -> 1
+    importance["stone boundary (eq. 13)"] *= fade                   # (0 before the stone stage: there are no stones)
+    return importance
+
+
+def throw_speed_at(step: int, settings: TrainingSettings, scales: Scales) -> float:
+    """Largest throw speed (dimensionless) at this step: from `first_throw_speed_m_s` up to the slider maximum
+    (3 m/s), reached after `full_throw_speed_after` of the stone stage."""
+    stone_start = settings.stage_steps["calm"] + settings.stage_steps["tilt"]   # first step of the stone stage
+    ramp_steps = max(settings.full_throw_speed_after * settings.stage_steps["stone"], 1)   # length of the speed-up
+    progress = min(max((step - stone_start) / ramp_steps, 0.0), 1.0)   # 0 -> 1
+    first, full = settings.first_throw_speed_m_s, scales.box.max_throw_speed   # m/s
+    return (first + (full - first) * progress) / scales.speed       # m/s -> dimensionless
+
+
 def weighted_total(terms: dict, importance: dict) -> torch.Tensor:
     """total = sum over the 8 equations of  importance_i * L_i.
     Fixed weights, as in Wandel et al. (2021). The equations are dimensionless, so every term is naturally of
@@ -120,14 +146,15 @@ def learning_rate_at(step: int, settings: TrainingSettings) -> float:
     return settings.final_learning_rate + (settings.learning_rate - settings.final_learning_rate) * cosine
 
 
-def training_step(model, optimizer, pool, settings, precision, h, dt):
-    """One training step. Returns (total loss, dict of the 8 raw loss terms, number of resets)."""
+def training_step(model, optimizer, pool, settings, precision, h, dt, importance=None):
+    """One training step. Returns (total loss, dict of the 8 raw loss terms, number of resets).
+    importance: the weights for this step (default: the fixed settings.importance)."""
     indices, state, box = pool.sample(settings.batch_size)          # 1. random batch from the pool
     with precision:                                                 # (bf16 only inside the network)
         next_state = model(state, box, h)                           # 2. the network's prediction
     terms = eq.loss_terms(state, next_state, box, pool.simulation.positions,
                           pool.simulation.initial_volume[indices], h, dt)   # 3. the physics loss
-    total = weighted_total(terms, settings.importance)              # weighted sum of the 8 equations
+    total = weighted_total(terms, importance or settings.importance)   # weighted sum of the 8 equations
     optimizer.zero_grad(set_to_none=True)                           # 4. clear old gradients
     total.backward()                                                #    gradients of the loss
     torch.nn.utils.clip_grad_norm_(model.parameters(), settings.gradient_clip)   # avoid huge updates
@@ -174,6 +201,9 @@ def train(settings: TrainingSettings, resume: bool = False):
         "time step": f"{settings.time_step_seconds * 1000:.1f} ms of water time per network step",
         "stages (steps)": ", ".join(f"{name} {steps:,}" for name, steps in settings.stage_steps.items())
                           + f"   (total {settings.total_steps:,})",
+        "stone stage": f"stone weight fades in over {settings.stone_fade_in_steps:,} steps; throws "
+                       f"{settings.first_throw_speed_m_s:.1f} -> {scales.box.max_throw_speed:.1f} m/s",
+        "pool health": "reset when volume is off > 5 % or water > 6 m/s; 1/4 of the scenes never get a stone",
         "learning rate": f"{settings.learning_rate:.1e} -> {settings.final_learning_rate:.1e} (cosine)",
         "log / checkpoint": f"every {settings.log_every} / {settings.checkpoint_every} steps",
         "start": f"resumed from step {start_step:,} (the pool starts again from calm water)" if start_step else "step 0",
@@ -187,19 +217,26 @@ def train(settings: TrainingSettings, resume: bool = False):
     term_names = list(settings.importance)                          # the 8 equations, in order
     if new_log:
         log.writerow(["step", "stage", "total"] + term_names + ["learning_rate", "seconds_per_step",
-                                                                "resets", "volume_error_mean", "potential_max", "stones_active"])
+                                                                "resets", "volume_error_mean", "potential_max", "stones_active",
+                                                                "scene_age_mean_s", "scene_age_max_s"])
 
     clock, resets_since_log = time.time(), 0                        # for the speed column
     for step in range(start_step, settings.total_steps):
         stage = stage_at(step, settings.stage_steps)                # calm, tilt or stone
         if stage != pool.stage:                                     # a new curriculum stage begins
+            if step > start_step:                                   # keep the network as it was at the end of the old stage
+                torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step,
+                            "settings": asdict(settings)}, run_dir / f"checkpoint_end_of_{pool.stage}.pt")
+                terminal.say(f"saved checkpoint_end_of_{pool.stage}.pt (the network after stage '{pool.stage}')")
             pool.set_stage(stage)
             terminal.say(f"---- step {step:,}: stage '{stage}' begins "
                          f"({ {'calm': 'water at rest', 'tilt': 'the box tilts', 'stone': 'stones are thrown in'}[stage] }) ----")
         for group in optimizer.param_groups:                        # learning-rate schedule
             group["lr"] = learning_rate_at(step, settings)
 
-        total, terms, resets = training_step(model, optimizer, pool, settings, precision, h, dt)
+        pool.max_throw_speed = throw_speed_at(step, settings, scales)   # slow throws first
+        total, terms, resets = training_step(model, optimizer, pool, settings, precision, h, dt,
+                                             importance_at(step, settings))
         resets_since_log += resets
 
         if (step + 1) % settings.log_every == 0 or step + 1 == settings.total_steps:   # write a log line
@@ -207,7 +244,8 @@ def train(settings: TrainingSettings, resume: bool = False):
             stats = pool.statistics()                               # health of the pool
             log.writerow([step + 1, stage, f"{float(total):.4e}"] + [f"{float(terms[n]):.4e}" for n in term_names]
                          + [f"{optimizer.param_groups[0]['lr']:.2e}", f"{seconds:.3f}", resets_since_log,
-                            f"{stats['volume_error_mean']:.4f}", f"{stats['potential_max']:.3f}", stats["stones_active"]])
+                            f"{stats['volume_error_mean']:.4f}", f"{stats['potential_max']:.3f}", stats["stones_active"],
+                            f"{stats['scene_age_mean_s']:.2f}", f"{stats['scene_age_max_s']:.2f}"])
             log_file.flush()                                        # keep the file up to date
             gpu_memory = torch.cuda.max_memory_allocated(device) / 1e9 if device.type == "cuda" else None
             terminal.row(step + 1, stage, float(total), terms, optimizer.param_groups[0]["lr"], seconds,

@@ -37,11 +37,12 @@ def load_network(args):
         torch.nn.init.normal_(model.network.output.bias, std=0.01)
         settings = {"network_size": "small", "grid": args.grid, "time_step_seconds": 1.0 / 60.0}
         return model, settings, 0, f"test_network_{args.grid}"
-    checkpoint = torch.load(Path("outputs/runs") / args.run / "checkpoint.pt", map_location="cpu", weights_only=False)
+    checkpoint = torch.load(Path("outputs/runs") / args.run / args.checkpoint, map_location="cpu", weights_only=False)
     settings = checkpoint["settings"]                               # how it was trained
     model = PhysicsNeuralSolver(settings["network_size"])           # same architecture
     model.load_state_dict(checkpoint["model"])                      # trained weights
-    return model, settings, checkpoint["step"], args.run
+    name = args.run if args.checkpoint == "checkpoint.pt" else f"{args.run}_{Path(args.checkpoint).stem.replace('checkpoint_', '')}"
+    return model, settings, checkpoint["step"], name                # e.g. coarse_small or coarse_small_end_of_tilt
 
 
 def network_stages(model, state, box):
@@ -102,6 +103,7 @@ def make_test_case(model, settings):
 def main():
     parser = argparse.ArgumentParser(description="Export a trained network for the browser viewer.")
     parser.add_argument("--run", default="coarse_small", help="run name under outputs/runs/")
+    parser.add_argument("--checkpoint", default="checkpoint.pt", help="e.g. checkpoint_end_of_tilt.pt (default: the final one)")
     parser.add_argument("--test-network", action="store_true", help="export a random network (to test the viewer)")
     parser.add_argument("--grid", choices=list(GRIDS), default="coarse", help="grid of the test network")
     args = parser.parse_args()

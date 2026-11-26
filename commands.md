@@ -120,11 +120,15 @@ tail -f train_<job id>.log
 ## 8. After training
 
 ```bash
+python -m physics_neural_solver.evaluate --run coarse_small --checkpoint checkpoint_end_of_tilt.pt
 python -m physics_neural_solver.evaluate --run coarse_small
 python -m physics_neural_solver.export_for_browser --run coarse_small
 ```
 
-Results: `outputs/evaluation/coarse_small/summary.md` and `outputs/export/coarse_small/`
+The first line tests the network as it was at the end of the tilt stage (before any stones), the second the final
+network. Results:
+`outputs/evaluation/coarse_small_end_of_tilt/summary.md`, `outputs/evaluation/coarse_small/summary.md` and
+`outputs/export/coarse_small/`
 
 ## 9. Send the results back
 

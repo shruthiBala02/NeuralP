@@ -2,6 +2,7 @@
 evaluate.py  -  test a trained physics neural solver against textbook answers (checks C1-C5 of PLAN.md)
 
     python -m physics_neural_solver.evaluate --run coarse_small       # uses outputs/runs/coarse_small/checkpoint.pt
+    python -m physics_neural_solver.evaluate --run coarse_small --checkpoint checkpoint_end_of_tilt.pt   # the network before stones
 
 The analytical answers are used ONLY here, never in training. Each test runs the trained network on its own
 for several seconds of water time (the same way the viewer will), and measures:
@@ -12,7 +13,7 @@ for several seconds of water time (the same way the viewer will), and measures:
     float   light stone (500 kg/m^3, 7 cm) released under water: fraction under water   (C4)
     roll    heavy stone on the floor, right end raised 10 degrees: it must roll left      (direction check)
 
-Output: outputs/evaluation/<run>/results.json and summary.md
+Output: outputs/evaluation/<run>/results.json and summary.md   (<run>_end_of_tilt/ etc. for a stage checkpoint)
 """
 
 import argparse                                                     # command-line options
@@ -29,8 +30,8 @@ from physics_neural_solver.simulation import Simulation             # scenes, ti
 from scene import water_volume                                      # volume of the water (eq. 7)
 
 
-def load_model(run: str, device):
-    checkpoint = torch.load(Path("outputs/runs") / run / "checkpoint.pt", map_location=device, weights_only=False)   # the trained network
+def load_model(run: str, device, checkpoint_name: str = "checkpoint.pt"):
+    checkpoint = torch.load(Path("outputs/runs") / run / checkpoint_name, map_location=device, weights_only=False)   # the trained network
     settings = checkpoint["settings"]                               # how it was trained
     model = PhysicsNeuralSolver(settings["network_size"]).to(device).eval()   # same architecture
     model.load_state_dict(checkpoint["model"])                      # trained weights
@@ -171,10 +172,12 @@ def main():
     parser.add_argument("--run", default="coarse_small", help="run name under outputs/runs/")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--quick", action="store_true", help="short versions of the tests (code check)")
+    parser.add_argument("--checkpoint", default="checkpoint.pt", help="e.g. checkpoint_end_of_tilt.pt (default: the final one)")
     args = parser.parse_args()
 
     device = torch.device(args.device)                              # where to run
-    model, settings = load_model(args.run, device)                  # the trained network
+    model, settings = load_model(args.run, device, args.checkpoint)  # the trained network
+    name = args.run if args.checkpoint == "checkpoint.pt" else f"{args.run}_{Path(args.checkpoint).stem.replace('checkpoint_', '')}"   # e.g. coarse_small_end_of_tilt
     seconds = 0.5 if args.quick else None                           # quick: very short tests
     results = {
         "still (C1, C5)": test_still(model, settings, device, **({"seconds": seconds} if seconds else {})),
@@ -184,10 +187,10 @@ def main():
         "roll (direction)": test_roll(model, settings, device, **({"seconds": seconds} if seconds else {})),
     }
 
-    out_dir = Path("outputs/evaluation") / args.run                 # where to write
+    out_dir = Path("outputs/evaluation") / name                     # where to write
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "results.json").write_text(json.dumps(results, indent=2))   # all numbers
-    lines = [f"# Evaluation of run '{args.run}'", ""]               # readable summary
+    lines = [f"# Evaluation of run '{args.run}' ({args.checkpoint})", ""]   # readable summary
     for name, result in results.items():
         lines.append(f"## {name}: {'PASS' if result['pass'] else 'FAIL'}")
         lines += [f"- {key}: {value:.4g}" if isinstance(value, float) else f"- {key}: {value}"

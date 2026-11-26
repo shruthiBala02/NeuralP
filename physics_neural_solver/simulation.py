@@ -234,3 +234,22 @@ class Simulation:
         bad |= ~torch.isfinite(self.water.potential).flatten(1).all(dim=1)   # ... or in A
         bad |= self.water.potential.abs().flatten(1).amax(dim=1) > 1e3   # unreasonably large flow
         return bad
+
+    def unhealthy_scenes(self, indices, max_volume_error, max_speed):
+        """Which of the scenes `indices` are no longer good training material (True = reset it):
+        blown up (NaN), water volume off by more than `max_volume_error` (e.g. 0.05 = 5 %), or water faster than
+        `max_speed` anywhere (dimensionless). Without this the pool fills up with broken water that the network
+        then keeps training on."""
+        bad = self.broken_scenes()[indices]                         # NaN / infinity / huge A
+        s = self.stones                                             # shorter name
+        stone_mask, _ = stone_fields(self.positions, s.centre[indices], s.velocity[indices], s.spin[indices],
+                                     s.radius[indices], s.active[indices])   # cells inside the stones
+        phi = torch.nan_to_num(self.water.phi[indices])             # (NaN scenes are already marked bad)
+        volume = water_volume(phi, self.solid, stone_mask, self.h)  # water volume now (eq. 7)
+        volume_error = (volume - self.initial_volume[indices]).abs() / self.initial_volume[indices].clamp(min=1e-6)
+        bad |= volume_error > max_volume_error                      # water appeared or disappeared
+        potential = torch.nan_to_num(self.water.potential[indices]) # the flow
+        velocity_c = eq.faces_to_centres(eq.velocity_from_vector_potential(potential, self.h))   # u at the centres
+        speed = velocity_c.norm(dim=1, keepdim=True) * (1.0 - self.solid)   # |u|, not inside the walls
+        bad |= speed.flatten(1).amax(dim=1) > max_speed             # unrealistically fast water
+        return bad
