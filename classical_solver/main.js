@@ -286,6 +286,7 @@ let totalRendered = 0;
 const testMode = new URLSearchParams(location.search).get("test");
 let testTime = 0;
 let testTimeSpeed = 1;
+let neuralClock = 0;   // neural solver: real time not yet simulated (it steps only in whole training steps)
 const testStone = { maxSinkSpeed: 0 };
 
 function animate() {
@@ -316,7 +317,14 @@ function animate() {
       stoneMesh.visible = true;
     }
   }
-  const dt = solver.fixedStep ?? realDt * testTimeSpeed;   // the neural solver always steps by its training time step
+  // The classical solver steps by the real frame time. The neural solver can only step by its training time step
+  // (1/60 s), so it steps only when the real clock has moved on by that much: on a 120 Hz screen every second frame,
+  // so the water plays at real speed on any screen. (Below 60 frames per second it plays in slow motion.)
+  let dt = realDt * testTimeSpeed;
+  if (solver.fixedStep) {
+    neuralClock = Math.min(neuralClock + realDt, 2 * solver.fixedStep);   // keep at most 2 steps of catching up
+    dt = neuralClock >= solver.fixedStep - 1e-6 ? solver.fixedStep : 0;   // a whole step is due, or nothing this frame
+  }
 
   if (dt > 0 && query.get("test") !== "equivalence" && solver.readback.some((s) => !s.busy)) {   // (no simulation during the equivalence test)
     // tilt: move towards the slider angle, at most 30 degrees per second
@@ -338,6 +346,7 @@ function animate() {
     const stones = Array.from({ length: substeps }, (_, s) => (stone.active ? stone.predicted(s * subDt) : null));
     solver.runFrame({ ...frame, substeps, dt: subDt, phiShift, stones },
       onSolverReadback);
+    if (solver.fixedStep) neuralClock -= solver.fixedStep;   // this step's real time is now simulated
     simulationTime += dt;
     submittedTimes.push([simulationTime, dt]);
     phiShift = 0;
