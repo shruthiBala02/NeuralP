@@ -270,9 +270,9 @@ gui.add(settings, "stoneDiameterCm", STONE.minDiameter * 100, STONE.maxDiameter 
 gui.add(settings, "stoneDensity", STONE.minDensity, STONE.maxDensity, 50).name("stone density (kg/m³)");
 gui.add(settings, "resetWater").name("reset water");
 gui.add(settings, "solver", ["classical", "neural"]).name("solver").onChange((value) => {
-  location.search = value === "neural" ? `?solver=neural&model=${modelName}` : `?grid=${gridName}`; });
+  location.search = value === "neural" ? `?solver=neural&model=${modelName}` : `?grid=${gridName}&model=${modelName}`; });  // keep the model name for switching back
 if (solverKind === "classical") {
-  gui.add(settings, "grid", Object.keys(GRIDS)).name("grid").onChange((value) => { location.search = `?grid=${value}`; });
+  gui.add(settings, "grid", Object.keys(GRIDS)).name("grid").onChange((value) => { location.search = `?grid=${value}&model=${modelName}`; });
 }
 
 // ---------------------------------------------------------------- animation loop
