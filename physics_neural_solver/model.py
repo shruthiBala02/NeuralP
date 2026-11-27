@@ -11,6 +11,9 @@ so they hold whatever the network outputs (hard constraints, not things to learn
     eq. 7   volume constant:         the surface is shifted to restore the starting volume exactly
     eq. 8   no pressure in the air
 (eq. 6, phi a true distance, is restored every few steps by the simulation: simulation.py)
+Pressure = still-water part + moving part. The still-water part rho g (depth) is computed exactly from the surface
+(depth = phi, |g| = 1 dimensionless); the network only predicts the (small) moving part. Water at rest is therefore
+exactly at rest whatever the surface does, and the network spends its effort on the flow.
 
 Inspired by:
     U-Net             Ronneberger, Fischer & Brox, MICCAI 2015
@@ -52,14 +55,25 @@ class BoxInputs:                                                    # everything
     initial_volume: torch.Tensor = None                             # (B,) water volume to keep (eq. 7); None = keep the current one
 
 
-INPUT_CHANNELS = 15                                                 # phi 1 + A 3 + p 1 + walls 1 + stone 1 + stone velocity 3 + gravity 3 + tilt rate 1 + tilt acceleration 1
-OUTPUT_CHANNELS = 4                                                 # change of A (3), change of p (1)  (phi is carried, not predicted)
+INPUT_CHANNELS = 15                                                 # phi 1 + A 3 + moving p 1 + walls 1 + stone 1 + stone velocity 3 + gravity 3 + tilt rate 1 + tilt acceleration 1
+OUTPUT_CHANNELS = 4                                                 # change of A (3), change of the MOVING pressure (1)
+                                                                    # (phi is carried, not predicted)
 
 NETWORK_SIZES = {                                                   # base number of channels (doubles at every level down)
     "small": 16,                                                    # ~1.4 million weights
     "medium": 32,                                                   # ~5.6 million weights
     "large": 64,                                                    # ~22 million weights
 }
+
+
+def still_water_pressure(phi: torch.Tensor) -> torch.Tensor:
+    """rho g (depth below the surface), dimensionless (rho = g = 1): phi in the water, 0 in the air (eq. 16)."""
+    return phi.clamp(min=0.0)
+
+
+def moving_pressure(pressure: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+    """The part of the pressure caused by motion: total minus the still-water part."""
+    return pressure - still_water_pressure(phi)
 
 
 def network_input(state: WaterState, box: BoxInputs) -> torch.Tensor:
@@ -74,7 +88,7 @@ def network_input(state: WaterState, box: BoxInputs) -> torch.Tensor:
     return torch.cat([                                              # join along the channel axis
         state.phi,                                                  # 1 channel:  where the water is
         state.potential,                                            # 3 channels: the vector potential (the flow)
-        state.pressure,                                             # 1 channel:  the pressure
+        moving_pressure(state.pressure, state.phi),                 # 1 channel:  the moving part of the pressure
         box.solid_mask.expand(batch, -1, -1, -1, -1),               # 1 channel:  where the walls are
         box.stone_mask,                                             # 1 channel:  where the stone is
         box.stone_velocity_field,                                   # 3 channels: how the stone moves
@@ -187,7 +201,8 @@ class PhysicsNeuralSolver(nn.Module):
             target = (eq.smoothed_step(state.phi, cell_size) * fluid).sum(dim=(1, 2, 3, 4)) * cell_size ** 3
         phi_next = eq.restore_volume(phi_next, fluid, target, cell_size)   # exactly the same amount of water (eq. 7)
 
-        pressure_next = state.pressure + change[:, 3:4]             # new pressure, before the surface condition
+        moving_next = moving_pressure(state.pressure, state.phi) + change[:, 3:4]   # new moving part of the pressure
+        pressure_next = moving_next + still_water_pressure(phi_next)  # + the still-water part of the NEW surface
         pressure_next = eq.apply_free_surface_pressure(pressure_next, phi_next, cell_size)  # p = 0 above the water (eq. 8)
 
         return WaterState(potential=potential_next, pressure=pressure_next, phi=phi_next)   # the water one step later

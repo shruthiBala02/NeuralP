@@ -107,9 +107,10 @@ class TrainingPool:
         state, box = self.simulation.inputs(indices)                # what the network reads
         return indices, state, box
 
-    def put_back(self, indices, next_water):
-        """Store the network's prediction, move tilt and stones exactly, then do random user actions."""
-        self.simulation.advance(indices, next_water)                # the pool now holds the predicted water
+    def put_back(self, indices, next_water, maintained: bool = False):
+        """Store the network's prediction, move tilt and stones exactly, then do random user actions.
+        maintained=True: phi was already re-distanced where due (multi-step training)."""
+        self.simulation.advance(indices, next_water, maintained)    # the pool now holds the predicted water
         actions = STAGES[self.stage]                                # what this stage allows
         chosen = torch.zeros(self.size, dtype=torch.bool, device=self.device)   # only touch the scenes just used
         chosen[indices] = True

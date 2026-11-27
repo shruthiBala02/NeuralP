@@ -59,10 +59,18 @@ def central_difference(f, dim, h):
     return (next_cell(f, dim) - previous_cell(f, dim)) / (2.0 * h)  # (f[i+1] - f[i-1]) / (2h)
 
 
+def last_face_inside(component, dim):
+    """The last face plane along `dim` lies OUTSIDE the box (beyond the high wall cell): use the wall face before it
+    instead, so the high walls are treated exactly like the low walls (there the cell copies its only face)."""
+    n = component.size(dim)                                         # planes along this direction
+    return torch.cat([component.narrow(dim, 0, n - 1), component.narrow(dim, n - 2, 1)], dim)
+
+
 def faces_to_centres(velocity):
-    ux = 0.5 * (velocity[:, 0:1] + previous_cell(velocity[:, 0:1], X))   # average the two x-faces of each cell
-    uy = 0.5 * (velocity[:, 1:2] + previous_cell(velocity[:, 1:2], Y))   # average the two y-faces
-    uz = 0.5 * (velocity[:, 2:3] + previous_cell(velocity[:, 2:3], Z))   # average the two z-faces
+    ux, uy, uz = (last_face_inside(velocity[:, c:c + 1], d) for c, d in ((0, X), (1, Y), (2, Z)))   # (symmetric walls)
+    ux = 0.5 * (ux + previous_cell(ux, X))                          # average the two x-faces of each cell
+    uy = 0.5 * (uy + previous_cell(uy, Y))                          # average the two y-faces
+    uz = 0.5 * (uz + previous_cell(uz, Z))                          # average the two z-faces
     return torch.cat([ux, uy, uz], dim=1)                           # velocity at the cell centres
 
 
@@ -159,14 +167,17 @@ def apply_free_surface_pressure(pressure, phi, h):
 #   to 0 on the six wall planes: no water can pass through a wall, whatever the network outputs. The network still
 #   controls everything else (also the flow along the walls). Layout: A_x[i,j,k] lives at (x_i, y_j+h/2, z_k+h/2),
 #   A_y at (x_i+h/2, y_j, z_k+h/2), A_z at (x_i+h/2, y_j+h/2, z_k); the wall planes are at index 0 and n-2.
+#   The plane at index n-1 lies OUTSIDE the box (beyond the high wall cells); it is set to 0 too, so the high walls
+#   behave exactly like the low walls (where no such plane exists) - otherwise the network could use it to change the
+#   ghost velocities in the high wall cells only (found by the mirror test, tests/test_symmetry.py).
 def wall_potential_mask(size, device):
     nx, ny, nz = size                                               # cells along x, y, z (with the wall layer)
     mask = torch.ones(1, 3, nx, ny, nz, device=device)              # 1 = keep
-    for index in (0, nx - 2):                                       # the two x-wall planes (x = x_0 + h/2, x_{n-2} + h/2)
+    for index in (0, nx - 2, nx - 1):                               # the two x-wall planes (+ the plane outside)
         mask[:, 1, index], mask[:, 2, index] = 0.0, 0.0             # A_y, A_z lie in them
-    for index in (0, ny - 2):                                       # floor and lid
+    for index in (0, ny - 2, ny - 1):                               # floor and lid (+ outside)
         mask[:, 0, :, index], mask[:, 2, :, index] = 0.0, 0.0       # A_x, A_z lie in them
-    for index in (0, nz - 2):                                       # front and back walls
+    for index in (0, nz - 2, nz - 1):                               # front and back walls (+ outside)
         mask[:, 0, :, :, index], mask[:, 1, :, :, index] = 0.0, 0.0  # A_x, A_y lie in them
     return mask
 

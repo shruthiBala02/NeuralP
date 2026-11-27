@@ -174,7 +174,8 @@ export class NeuralWaterSolver {
     this.operation("curl", S.CURL, [curlParams, this.state.potential, this.velocityNow], N);   // u now
     const mean = this.storage(3);
     this.operation("mean", S.POTENTIAL_CHANGE_MEAN, [cropParams, change, mean], 0, 3);   // mean of dA (3 workgroups)
-    this.operation("apply", S.APPLY_CHANGE, [cropParams, change, mean, this.state.potential, this.state.pressure], N);   // A (walls), p
+    this.operation("apply", S.APPLY_CHANGE, [cropParams, change, mean, this.state.potential, this.state.pressure,
+                                             this.state.phi], N);   // A (walls), moving part of p
     this.operation("curl", S.CURL, [curlParams, this.state.potential, this.state.velocity], N);   // u next
     this.operation("carry", S.CARRY_SURFACE, [this.gridParams, this.state.phi, this.velocityNow, this.state.velocity,
                                               this.phiTemporary], N);   // eq. 5: phi carried by the flow

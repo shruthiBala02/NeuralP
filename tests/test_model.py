@@ -59,7 +59,7 @@ def test_untrained_network_keeps_calm_water_exactly(geometry):
     next_state = PhysicsNeuralSolver("small")(state, box, h)        # last layer starts at zero: no change
     assert torch.allclose(next_state.phi, state.phi, atol=1e-5)     # no flow: the surface stays where it is
     assert torch.allclose(next_state.potential, state.potential)    # flow unchanged
-    assert torch.allclose(next_state.pressure, state.pressure)      # pressure unchanged
+    assert torch.allclose(next_state.pressure, state.pressure, atol=1e-5)   # pressure unchanged (still-water part follows phi)
 
 
 # ---------------------------------------------------------------------------------------------- the strict rules

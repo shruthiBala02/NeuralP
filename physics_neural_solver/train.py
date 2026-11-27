@@ -36,9 +36,11 @@ import torch                                                        # tensors an
 
 from config import GRIDS, Scales                                    # grids and reference scales
 from physics_neural_solver import physical_equations as eq          # all equations and the loss
-from physics_neural_solver.model import PhysicsNeuralSolver, count_weights   # the network
+from physics_neural_solver.model import PhysicsNeuralSolver, WaterState, count_weights   # the network
+from physics_neural_solver.symmetry import mirror_some              # front-to-back mirroring
 from physics_neural_solver.plot_losses import plot as plot_losses  # the loss graph (losses.png)
 from physics_neural_solver.terminal_log import TerminalLog          # progress in the terminal
+from physics_neural_solver.training_checks import describe, run_checks, write_checks   # in-training checks
 from physics_neural_solver.training_pool import TrainingPool        # where the training states come from
 
 
@@ -81,6 +83,14 @@ class TrainingSettings:
     keep_every: int = 200000                                        # a permanent copy every 200k steps: checkpoint_step_200000.pt ...
     restart_every: int = 200000                                     # the learning rate starts a new cosine cycle every 200k steps
     plot_every: int = 10000                                         # steps between redrawing losses.png
+    unroll_steps: int = 2                                           # network steps per training step, gradients through all of them
+                                                                    # (the network feels its own errors piling up: stable long runs)
+    noise_speed: float = 0.01                                       # noise added to the starting flow (dimensionless speed, ~1.6 cm/s)
+    noise_pressure: float = 0.002                                   # ... and to the moving pressure (~0.5 mm of water)
+    mirror: bool = True                                             # mirror about half of the scenes front-to-back (z -> -z)
+    conflict_free: bool = False                                     # ConFIG (Liu et al. 2024): combine the losses so none gets worse
+    check_every: int = 10000                                        # steps between the in-training checks (still water, sloshing)
+    check_seconds: float = 5.0                                      # water time of each check
     seed: int = 0                                                   # random seed
     device: str = "auto"                                            # "auto", "cuda", "mps" or "cpu"
 
@@ -164,21 +174,94 @@ def learning_rate_at(step: int, settings: TrainingSettings) -> float:
     return settings.final_learning_rate + (settings.learning_rate - settings.final_learning_rate) * cosine
 
 
+def add_noise(state, h, settings):
+    """Small random disturbances of the flow and the moving pressure, so the network learns to correct its own small
+    mistakes instead of amplifying them (Sanchez-Gonzalez et al. 2020). The noisy flow still obeys the wall rule."""
+    shape = state.potential.shape[2:]                               # grid size
+    wall_mask = eq.wall_potential_mask(shape, state.potential.device)   # no flow through walls, also for the noise
+    flow_noise = torch.randn_like(state.potential) * (0.5 * h * settings.noise_speed) * wall_mask   # u = curl A ~ A / h
+    water = (state.phi > 0).float()                                 # pressure only exists in the water
+    pressure_noise = torch.randn_like(state.pressure) * settings.noise_pressure * water
+    return WaterState(state.potential + flow_noise, state.pressure + pressure_noise, state.phi)
+
+
 def training_step(model, optimizer, pool, settings, precision, h, dt, importance=None):
-    """One training step. Returns (total loss, dict of the 8 raw loss terms, number of resets).
+    """One training step: `unroll_steps` network steps in a row, with gradients through all of them.
+    Returns (total loss, dict of the raw loss terms averaged over the steps, number of resets).
     importance: the weights for this step (default: the fixed settings.importance)."""
+    importance = importance or settings.importance                  # the weights
+    sim = pool.simulation                                           # the scenes (tilt and stones are moved exactly)
     indices, state, box = pool.sample(settings.batch_size)          # 1. random batch from the pool
-    with precision:                                                 # (bf16 only inside the network)
-        next_state = model(state, box, h)                           # 2. the network's prediction
-    terms = eq.loss_terms(state, next_state, box, pool.simulation.positions,
-                          pool.simulation.initial_volume[indices], h, dt)   # 3. the physics loss
-    total = weighted_total(terms, importance or settings.importance)   # weighted sum of the 8 equations
-    optimizer.zero_grad(set_to_none=True)                           # 4. clear old gradients
-    total.backward()                                                #    gradients of the loss
+    state = add_noise(state, h, settings)                           # 2. a little noise on the starting water
+    mirrored = (torch.rand(len(indices), device=state.phi.device) < 0.5) if settings.mirror \
+        else torch.zeros(len(indices), dtype=torch.bool, device=state.phi.device)   # 3. scenes seen front-to-back mirrored
+    totals, sums = [], {}                                           # per-step weighted losses, summed raw terms
+    for k in range(settings.unroll_steps):                          # 4. several steps in a row
+        if k > 0:
+            _, box = sim.inputs(indices)                            # tilt and stone have moved on (exactly)
+        seen_state, seen_box = mirror_some(state, box, mirrored)    # what the network sees (mirrored or not)
+        with precision:                                             # (bf16 only inside the network)
+            seen_next = model(seen_state, seen_box, h)              # the network's prediction
+        terms = eq.loss_terms(seen_state, seen_next, seen_box, sim.positions, box.initial_volume, h, dt)   # physics loss
+        totals.append(weighted_total(terms, importance))            # (mirroring does not change the physics)
+        for name, value in terms.items():
+            sums[name] = sums.get(name, 0.0) + value / settings.unroll_steps
+        next_state, _ = mirror_some(seen_next, seen_box, mirrored)  # back to the real orientation
+        next_state = WaterState(next_state.potential, next_state.pressure,
+                                sim.maintain(indices, next_state.phi))   # re-distancing when due (with gradients)
+        last = k == settings.unroll_steps - 1                       # the last step of this training step?
+        if last:
+            resets = pool.put_back(indices, next_state, maintained=True)   # 6. into the pool + user actions, resets
+        else:
+            sim.advance(indices, next_state, maintained=True)       # move tilt and stones on, no actions in between
+        state = next_state                                          # the next step starts from the prediction
+    total = sum(totals) / settings.unroll_steps                     # average over the steps
+    optimizer.zero_grad(set_to_none=True)                           # 5. clear old gradients
+    if settings.conflict_free:                                      # ConFIG: the losses combined without conflicts
+        learned = {name: importance[name] * value for name, value in sums.items() if importance[name] > 0}
+        set_conflict_free_gradients(model, learned)
+    else:
+        total.backward()                                            #    gradients of the weighted sum
     torch.nn.utils.clip_grad_norm_(model.parameters(), settings.gradient_clip)   # avoid huge updates
     optimizer.step()                                                #    update the weights
-    resets = pool.put_back(indices, next_state)                     # 5. prediction back into the pool
-    return total.detach(), {name: value.detach() for name, value in terms.items()}, resets
+    return total.detach(), {name: value.detach() for name, value in sums.items()}, resets
+
+
+def set_conflict_free_gradients(model, losses: dict):
+    """ConFIG (Liu, Chu & Thuerey 2024): one update direction that makes NO loss worse.
+    Each loss gets its own gradient g_i. The direction v has the same angle to every g_i (v = pinv of the unit
+    gradients times 1), and its length is the sum of the projections of the g_i on v. Losses that are 0 (e.g. no
+    stone in the batch) are left out."""
+    parameters = [p for p in model.parameters() if p.requires_grad]  # the weights
+    names = [name for name, value in losses.items() if float(value) > 0]   # losses that can push at all
+    gradients = []                                                  # one flat gradient per loss
+    for i, name in enumerate(names):
+        grads = torch.autograd.grad(losses[name], parameters, retain_graph=i < len(names) - 1, allow_unused=True)
+        gradients.append(torch.cat([(g if g is not None else torch.zeros_like(p)).flatten()
+                                    for g, p in zip(grads, parameters)]))
+    combined = conflict_free_direction(gradients)                   # the ConFIG direction
+    if combined.numel() == 0:                                       # no loss pushes at all: no update
+        combined = torch.zeros(sum(p.numel() for p in parameters), device=parameters[0].device)
+    offset = 0                                                      # write it back into the .grad of every weight
+    for p in parameters:
+        n = p.numel()
+        p.grad = combined[offset:offset + n].view_as(p).clone()
+        offset += n
+
+
+def conflict_free_direction(gradients):
+    """The ConFIG combination of a list of flat gradients (each a 1D tensor)."""
+    gradients = [g for g in gradients if float(g.norm()) > 0]       # only the ones that push
+    if not gradients:
+        return torch.zeros(0)                                       # (caller handles: no update)
+    G = torch.stack(gradients)                                      # (m, N)
+    units = G / G.norm(dim=1, keepdim=True)                         # unit gradients
+    gram = units @ units.T                                          # (m, m) their cosines
+    weights = torch.linalg.pinv(gram) @ torch.ones(len(gradients), device=G.device)   # pinv(U^T) 1 = U^T pinv(U U^T) 1
+    direction = units.T @ weights                                   # the same angle to every gradient
+    direction = direction / direction.norm().clamp(min=1e-12)       # unit length
+    length = (G @ direction).sum()                                  # sum of the projections
+    return length * direction
 
 
 # ------------------------------------------------------------------------------------------------------
@@ -225,6 +308,12 @@ def train(settings: TrainingSettings, resume: bool = False):
         "strict rules": "built in, exact: incompressible, no flow through walls, surface carried by the flow, "
                         "volume restored every step, phi re-distanced every 4 steps",
         "learned": "momentum (+ worst 1 % of faces), no-shear, wall law, stone, energy rule",
+        "pressure": "still-water part exact (from the surface), the network learns the moving part",
+        "training step": f"{settings.unroll_steps} network steps (gradients through all), noise, "
+                         f"{'mirroring, ' if settings.mirror else ''}"
+                         f"{'ConFIG' if settings.conflict_free else 'weighted sum'}",
+        "checks": f"still water + sloshing ({settings.check_seconds:.0f} s each) every {settings.check_every:,} steps "
+                  f"-> checks.csv",
         "learning rate": f"{settings.learning_rate:.1e} -> {settings.final_learning_rate:.1e} (cosine, restarted every "
                          f"{settings.restart_every:,} steps)",
         "log / checkpoint": f"every {settings.log_every} / {settings.checkpoint_every} steps; a kept copy every "
@@ -284,6 +373,13 @@ def train(settings: TrainingSettings, resume: bool = False):
                 kept = run_dir / f"checkpoint_step_{step + 1}.pt"
                 torch.save(checkpoint, kept)
                 terminal.say(f"kept the network at step {step + 1:,}  ->  {kept.name}")
+            if (step + 1) % settings.check_every == 0 or last:      # short tests of the current network
+                try:
+                    results = run_checks(model, asdict(settings), device, settings.check_seconds)
+                    write_checks(run_dir, step + 1, results)        # -> checks.csv
+                    terminal.say(f"check at step {step + 1:,}: {describe(results)}")
+                except Exception as error:                          # a check must never stop training
+                    terminal.say(f"check at step {step + 1:,} failed: {error}")
             if (step + 1) % settings.plot_every == 0 or last:       # redraw the graphs now and then
                 try:
                     plot_losses(run_dir)                            # refresh losses.png
@@ -308,10 +404,14 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--resume", action="store_true", help="continue from this run's checkpoint")
     parser.add_argument("--smoke-test", action="store_true", help="30 steps on a tiny pool, just to check the code")
+    parser.add_argument("--unroll", type=int, default=2, help="network steps per training step (gradients through all)")
+    parser.add_argument("--conflict-free", action="store_true", help="combine the losses with ConFIG instead of a weighted sum")
+    parser.add_argument("--no-mirror", action="store_true", help="do not mirror scenes front-to-back")
     args = parser.parse_args()
 
     settings = TrainingSettings(grid=args.grid, network_size=args.network, batch_size=args.batch_size,
-                                precision=args.precision, device=args.device)
+                                precision=args.precision, device=args.device, unroll_steps=args.unroll,
+                                conflict_free=args.conflict_free, mirror=not args.no_mirror)
     settings.run_name = args.run_name or f"{args.grid}_{args.network}"
     if args.steps:                                                  # scale the stages to the requested total
         scale = args.steps / settings.total_steps
@@ -320,7 +420,7 @@ def main():
         settings.run_name, settings.pool_size, settings.batch_size = "smoke_test", 8, 2
         settings.stage_steps = {"calm": 10, "tilt": 10, "stone": 10}
         settings.log_every, settings.checkpoint_every, settings.keep_every, settings.plot_every = 5, 30, 30, 30
-        settings.restart_every = 30
+        settings.restart_every, settings.check_every, settings.check_seconds = 30, 30, 0.2
     train(settings, resume=args.resume)
 
 

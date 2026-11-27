@@ -108,28 +108,33 @@ class Simulation:
     # --------------------------------------------------------------------------------------------------
     # One step forward (after the network has predicted the new water)
     # --------------------------------------------------------------------------------------------------
-    def advance(self, indices, next_water: WaterState):
-        """Store the network's new water for the scenes `indices`, then move the tilt and the stones exactly."""
-        self.water.potential[indices] = next_water.potential.detach()   # keep the prediction (no gradients in the pool)
+    def advance(self, indices, next_water: WaterState, maintained: bool = False):
+        """Store the network's new water for the scenes `indices`, then move the tilt and the stones exactly.
+        maintained=True: phi has already been re-distanced where due (multi-step training does it with gradients)."""
+        phi = next_water.phi.detach()                               # the new surface (no gradients in the pool)
+        if not maintained:
+            phi = self.maintain(indices, phi)                       # keep phi a true distance (eq. 6), every few steps
+        self.water.potential[indices] = next_water.potential.detach()   # keep the prediction
         self.water.pressure[indices] = next_water.pressure.detach()
-        self.water.phi[indices] = next_water.phi.detach()
-        self._redistance_when_due(indices)                          # keep phi a true distance (eq. 6), every few steps
+        self.water.phi[indices] = phi
         self._advance_tilt(indices)                                 # the box turns towards its target
         self._advance_stones(indices, next_water)                   # Newton + Morison + contacts
         self.steps_since_reset[indices] += 1                        # one step older
 
-    def _redistance_when_due(self, indices):
-        """Every REDISTANCE_EVERY steps of a scene: make phi a true distance again (eq. 6, exact), then restore the
-        volume exactly (eq. 7) - re-distancing may shift the surface by a hair."""
+    def maintain(self, indices, phi):
+        """phi (B, 1, X, Y, Z) of the scenes `indices` right after a network step. Every REDISTANCE_EVERY steps of a
+        scene: make phi a true distance again (eq. 6, exact), then restore the volume exactly (eq. 7) - re-distancing
+        may shift the surface by a hair. Works with gradients (used inside multi-step training too)."""
         indices = torch.as_tensor(indices, device=self.device)      # (a list or a tensor)
-        due = indices[(self.steps_since_reset[indices] + 1) % eq.REDISTANCE_EVERY == 0]   # scenes whose turn it is
-        if len(due) == 0:
-            return
+        due = (self.steps_since_reset[indices] + 1) % eq.REDISTANCE_EVERY == 0   # (B,) scenes whose turn it is
+        if not bool(due.any()):
+            return phi                                              # nothing to do this step
         s = self.stones                                             # shorter name
-        stone_mask, _ = stone_fields(self.positions, s.centre[due], s.velocity[due], s.spin[due], s.radius[due], s.active[due])
-        phi = eq.redistance(self.water.phi[due], self.solid, self.h)   # |grad phi| = 1 again
+        stone_mask, _ = stone_fields(self.positions, s.centre[indices], s.velocity[indices], s.spin[indices],
+                                     s.radius[indices], s.active[indices])   # cells inside the stones
         fluid = (1.0 - self.solid) * (1.0 - stone_mask)             # cells that can hold water
-        self.water.phi[due] = eq.restore_volume(phi, fluid, self.initial_volume[due], self.h)   # the same amount of water
+        fixed = eq.restore_volume(eq.redistance(phi, self.solid, self.h), fluid, self.initial_volume[indices], self.h)
+        return torch.where(due.view(-1, 1, 1, 1, 1), fixed, phi)    # only the scenes whose turn it is
 
     def _advance_tilt(self, indices):
         gain = TILT_GAIN_PER_SECOND * self.scales.time              # the same 4 per second as the viewer, dimensionless

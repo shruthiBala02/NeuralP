@@ -230,7 +230,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
   output[1u * padded + index] = potential[0u * cells + n];
   output[2u * padded + index] = potential[1u * cells + n];
   output[3u * padded + index] = potential[2u * cells + n];
-  output[4u * padded + index] = pressure[n];
+  output[4u * padded + index] = pressure[n] - max(phi[n], 0.0);   // the moving part of the pressure (minus the still-water part)
   output[5u * padded + index] = select(0.0, 1.0, wall);
   output[6u * padded + index] = select(0.0, 1.0, in_stone);
   output[7u * padded + index] = stone_velocity.x;
@@ -276,7 +276,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 // ---------------------------------------------------------------------------------------------------------------
 // Apply the network output (model.PhysicsNeuralSolver.forward):
 //   A = (A + dA - mean(dA)) x wall mask    (eq. 1 + eq. 10: A's in-wall components are 0 on the six wall planes)
-//   p = p + dp                             (the air is set to 0 later, after the surface has moved: MASK_PRESSURE)
+//   p = p - max(phi, 0) + dp               (the new MOVING pressure; the still-water part of the new surface is
+//                                           added after the surface has moved: MASK_PRESSURE)
 // ---------------------------------------------------------------------------------------------------------------
 export const APPLY_CHANGE = /* wgsl */ `
 struct Params { nx: u32, ny: u32, nz: u32, p0: u32, px: u32, py: u32, pz: u32, p1: u32 };
@@ -285,11 +286,12 @@ struct Params { nx: u32, ny: u32, nz: u32, p0: u32, px: u32, py: u32, pz: u32, p
 @group(0) @binding(2) var<storage, read> mean: array<f32>;
 @group(0) @binding(3) var<storage, read_write> potential: array<f32>;
 @group(0) @binding(4) var<storage, read_write> pressure: array<f32>;
+@group(0) @binding(5) var<storage, read> phi: array<f32>;
 ${INDEX}
 fn inWallPlane(c: u32, x: u32, y: u32, z: u32) -> bool {       // eq. 10: this component of A lies in a wall plane
-  let xw = x == 0u || x == P.nx - 2u;                          // the x-wall planes (index 0 and n-2)
-  let yw = y == 0u || y == P.ny - 2u;                          // floor and lid
-  let zw = z == 0u || z == P.nz - 2u;                          // front and back
+  let xw = x == 0u || x >= P.nx - 2u;                          // the x-wall planes (index 0, n-2) + the plane outside (n-1)
+  let yw = y == 0u || y >= P.ny - 2u;                          // floor and lid
+  let zw = z == 0u || z >= P.nz - 2u;                          // front and back
   if (c == 0u) { return yw || zw; }                            // A_x lies in floor/lid and front/back planes
   if (c == 1u) { return xw || zw; }                            // A_y in the x-walls and front/back
   return xw || yw;                                             // A_z in the x-walls and floor/lid
@@ -306,7 +308,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let a = potential[c * cells + index] + change[c * padded + p_index] - mean[c];
     potential[c * cells + index] = select(a, 0.0, inWallPlane(c, x, y, z));
   }
-  pressure[index] = pressure[index] + change[3u * padded + p_index];
+  pressure[index] = pressure[index] - max(phi[index], 0.0) + change[3u * padded + p_index];   // moving part
 }`;
 
 // Shared by the strict-rule kernels below
@@ -448,7 +450,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
   phi[index] = phi[index] + stats[2];
 }`;
 
-// eq. 8: no pressure in the air (after the surface has moved)
+// pressure = moving part + still-water part of the NEW surface;  eq. 8: no pressure in the air
 export const MASK_PRESSURE = /* wgsl */ `
 ${GRID}
 @group(0) @binding(0) var<uniform> G: Grid;
@@ -459,7 +461,7 @@ ${INDEX}
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
   let index = threadIndex(gid, groups);
   if (index >= G.nx * G.ny * G.nz) { return; }
-  pressure[index] = select(0.0, pressure[index], phi[index] > 0.0);
+  pressure[index] = select(0.0, pressure[index] + max(phi[index], 0.0), phi[index] > 0.0);
 }`;
 
 // ---------------------------------------------------------------------------------------------------------------

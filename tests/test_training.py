@@ -11,8 +11,10 @@ import torch                                                        # tensors
 from config import COARSE, Scales                                   # grid and reference scales
 from physics_neural_solver import physical_equations as eq          # the loss
 from physics_neural_solver.model import PhysicsNeuralSolver, WaterState   # the network
-from physics_neural_solver.train import (TrainingSettings, importance_at, learning_rate_at, stage_at, throw_speed_at,
-                                         train, weighted_total)
+from physics_neural_solver.train import (TrainingSettings, add_noise, conflict_free_direction, importance_at,
+                                         learning_rate_at, precision_context, stage_at, throw_speed_at, train,
+                                         training_step, weighted_total)
+from physics_neural_solver.training_checks import run_checks
 from scene import water_volume                                      # volume (eq. 7)
 from physics_neural_solver.training_pool import STONE_FREE_FRACTION, TrainingPool   # training states
 
@@ -138,6 +140,76 @@ def test_exact_rules_have_no_weight_in_the_loss():
         assert importance[name] > 0.0                               # learned
 
 
+def small_settings(**changes):
+    settings = TrainingSettings(network_size="small", pool_size=8, batch_size=4, device="cpu")
+    for name, value in changes.items():
+        setattr(settings, name, value)
+    return settings
+
+
+def test_training_step_unrolls_several_steps_with_gradients():
+    torch.manual_seed(0)
+    settings = small_settings(unroll_steps=2)
+    pool = TrainingPool(settings.pool_size, COARSE, "cpu", DT, seed=4)
+    model = PhysicsNeuralSolver("small")
+    torch.nn.init.normal_(model.network.output.weight, std=0.01)    # (a zero last layer gives earlier layers no gradient)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    before = [p.detach().clone() for p in model.parameters()]
+    age_before = pool.simulation.steps_since_reset.clone()
+    total, terms, resets = training_step(model, optimizer, pool, settings, precision_context("fp32", torch.device("cpu")),
+                                         pool.simulation.h, DT)
+    assert torch.isfinite(total)
+    aged = pool.simulation.steps_since_reset - age_before
+    assert int(aged.max()) == 2                                     # the sampled scenes moved on 2 steps ...
+    assert int((aged == 2).sum()) + resets == settings.batch_size   # ... except those reset afterwards (health check)
+    changed = sum(int(not torch.equal(a, b)) for a, b in zip(before, model.parameters()))
+    assert changed == len(before)                                   # every weight was updated
+
+
+def test_noise_keeps_the_walls_closed():
+    torch.manual_seed(0)
+    pool = TrainingPool(4, COARSE, "cpu", DT)
+    _, state, _ = pool.sample(4)
+    noisy = add_noise(state, pool.simulation.h, small_settings(noise_speed=0.5))   # (a lot of noise)
+    u = eq.velocity_from_vector_potential(noisy.potential, pool.simulation.h)
+    through_walls, _ = eq.no_penetration_residual(u)
+    assert through_walls.abs().max() < 1e-5                         # still nothing flows through a wall
+    assert float(u.abs().max()) > 0.1                               # but the flow is disturbed
+    assert torch.all(noisy.pressure[state.phi <= 0] == state.pressure[state.phi <= 0])   # no pressure noise in the air
+
+
+def test_conflict_free_direction_makes_no_loss_worse():
+    g1, g2 = torch.tensor([1.0, 0.0]), torch.tensor([-0.5, 1.0])    # two gradients that conflict (negative dot product)
+    d = conflict_free_direction([g1, g2])
+    assert float(d @ g1) > 0 and float(d @ g2) > 0                  # the update helps both losses
+    cos1, cos2 = float(d @ g1 / g1.norm() / d.norm()), float(d @ g2 / g2.norm() / d.norm())
+    assert abs(cos1 - cos2) < 1e-5                                  # the same angle to both
+    same = conflict_free_direction([g1, g1])
+    assert torch.allclose(same, 2 * g1)                             # no conflict: the plain sum
+    assert torch.allclose(conflict_free_direction([g1, torch.zeros(2)]), g1)   # a zero gradient is left out
+
+
+def test_conflict_free_training_step_runs():
+    torch.manual_seed(0)
+    settings = small_settings(unroll_steps=1, conflict_free=True)
+    pool = TrainingPool(settings.pool_size, COARSE, "cpu", DT, seed=5)
+    pool.set_stage("tilt")
+    model = PhysicsNeuralSolver("small")
+    torch.nn.init.normal_(model.network.output.weight, std=0.01)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    before = model.network.output.weight.detach().clone()
+    total, _, _ = training_step(model, optimizer, pool, settings, precision_context("fp32", torch.device("cpu")),
+                                pool.simulation.h, DT)
+    assert torch.isfinite(total) and not torch.equal(before, model.network.output.weight)   # it trained
+
+
+def test_in_training_checks_run():
+    model = PhysicsNeuralSolver("small")                            # untrained: the water stays still
+    from dataclasses import asdict
+    results = run_checks(model, asdict(small_settings()), torch.device("cpu"), seconds=0.3)
+    assert results["still_fastest_m_s"] < 1e-6 and results["still_volume_change"] < 1e-5
+
+
 def test_weighted_total_uses_the_importance():
     total = weighted_total({"a": torch.tensor(2.0), "b": torch.tensor(3.0)}, {"a": 1.0, "b": 20.0})
     assert float(total) == 62.0                                     # 1 x 2 + 20 x 3
@@ -195,11 +267,13 @@ def test_training_runs_and_resumes(tmp_path):
         settings = TrainingSettings(run_name="t", network_size="small", pool_size=4, batch_size=2, device="cpu",
                                     stage_steps={"calm": 3, "tilt": 3, "stone": 3})
         settings.log_every, settings.checkpoint_every, settings.keep_every, settings.plot_every = 3, 3, 3, 3
+        settings.check_every, settings.check_seconds = 3, 0.2           # (short checks)
         train(settings)                                             # 9 steps
         checkpoint = torch.load("outputs/runs/t/checkpoint.pt", weights_only=False)
         assert checkpoint["step"] == 9
         assert torch.load("outputs/runs/t/checkpoint_end_of_calm.pt", weights_only=False)["step"] == 3   # stage checkpoints
         assert torch.load("outputs/runs/t/checkpoint_end_of_tilt.pt", weights_only=False)["step"] == 6
+        assert len(open("outputs/runs/t/checks.csv").read().strip().splitlines()) == 1 + 3   # header + checks at 3, 6, 9
         for kept in (3, 6, 9):                                      # a permanent copy every keep_every steps
             assert torch.load(f"outputs/runs/t/checkpoint_step_{kept}.pt", weights_only=False)["step"] == kept
         settings.stage_steps = {"calm": 3, "tilt": 3, "stone": 6}   # 3 more steps
